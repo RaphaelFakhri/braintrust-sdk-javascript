@@ -72,6 +72,10 @@ export function getExtensionFromMediaType(mediaType: string): string {
  */
 export function convertDataToBlob(data: any, mediaType: string): Blob | null {
   try {
+    if (data instanceof URL) {
+      if (data.protocol !== "data:") return null;
+      data = data.href;
+    }
     if (typeof data === "string") {
       // Could be base64, data URL, or regular URL
       if (data.startsWith("data:")) {
@@ -160,15 +164,32 @@ export function processInputAttachments(
       return node;
     }
 
-    if (node instanceof BaseAttachment || node instanceof URL) return node;
+    if (node instanceof BaseAttachment) return node;
+    if (node instanceof URL) {
+      if (node.protocol !== "data:") return node;
+      if (!captureAttachments) return undefined;
+      const mediaType = inferMediaTypeFromDataUrl(
+        node.href,
+        "application/octet-stream",
+      );
+      return (
+        toAttachment(
+          node,
+          mediaType,
+          `file.${getExtensionFromMediaType(mediaType)}`,
+        ) ?? node
+      );
+    }
 
     // OpenAI chat image_url content format
     if (
       node.type === "image_url" &&
       node.image_url &&
       typeof node.image_url === "object" &&
-      typeof node.image_url.url === "string" &&
-      node.image_url.url.startsWith("data:")
+      ((typeof node.image_url.url === "string" &&
+        node.image_url.url.startsWith("data:")) ||
+        (node.image_url.url instanceof URL &&
+          node.image_url.url.protocol === "data:"))
     ) {
       if (!captureAttachments)
         return omitMediaData({
@@ -176,7 +197,7 @@ export function processInputAttachments(
           image_url: omitMediaData(node.image_url, "url"),
         });
       const mediaType = inferMediaTypeFromDataUrl(
-        node.image_url.url,
+        String(node.image_url.url),
         "image/png",
       );
       const filename = `image.${getExtensionFromMediaType(mediaType)}`;
@@ -233,8 +254,10 @@ export function processInputAttachments(
       node.type === "file" &&
       node.file &&
       typeof node.file === "object" &&
-      typeof node.file.file_data === "string" &&
-      node.file.file_data.startsWith("data:")
+      ((typeof node.file.file_data === "string" &&
+        node.file.file_data.startsWith("data:")) ||
+        (node.file.file_data instanceof URL &&
+          node.file.file_data.protocol === "data:"))
     ) {
       if (!captureAttachments)
         return omitMediaData({
@@ -242,7 +265,7 @@ export function processInputAttachments(
           file: omitMediaData(node.file, "file_data"),
         });
       const mediaType = inferMediaTypeFromDataUrl(
-        node.file.file_data,
+        String(node.file.file_data),
         "application/octet-stream",
       );
       const filename =
@@ -269,14 +292,15 @@ export function processInputAttachments(
         return node;
       }
       if (!captureAttachments) {
-        return node.image instanceof URL ||
+        return (node.image instanceof URL && node.image.protocol !== "data:") ||
           (typeof node.image === "string" && /^https?:/.test(node.image))
           ? node
           : omitMediaData(node, "image");
       }
       let mediaType = "image/png";
-      if (typeof node.image === "string" && node.image.startsWith("data:")) {
-        mediaType = inferMediaTypeFromDataUrl(node.image, mediaType);
+      const image = node.image instanceof URL ? node.image.href : node.image;
+      if (typeof image === "string" && image.startsWith("data:")) {
+        mediaType = inferMediaTypeFromDataUrl(image, mediaType);
       } else if (node.mediaType) {
         mediaType = node.mediaType;
       }
@@ -300,7 +324,7 @@ export function processInputAttachments(
         return node;
       }
       if (!captureAttachments) {
-        return node.data instanceof URL ||
+        return (node.data instanceof URL && node.data.protocol !== "data:") ||
           (typeof node.data === "string" && /^https?:/.test(node.data))
           ? node
           : omitMediaData(node, "data");

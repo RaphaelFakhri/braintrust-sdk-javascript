@@ -348,6 +348,7 @@ function filenameFromContentDisposition(value: string | undefined) {
 }
 
 function filenameFromPath(value: string): string | undefined {
+  if (/^data:/i.test(value)) return undefined;
   const withoutQuery = value.split(/[?#]/, 1)[0];
   return withoutQuery.split(/[\\/]/).pop() || undefined;
 }

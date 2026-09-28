@@ -17,7 +17,11 @@ import {
   processInputAttachments,
 } from "./wrappers/attachment-utils";
 import { processAttachmentsInInput } from "./instrumentation/plugins/anthropic-plugin";
-import { processAISDKGenerateImageOutput } from "./instrumentation/plugins/ai-sdk-plugin";
+import {
+  processAISDKCallInput,
+  processAISDKGenerateImageInput,
+  processAISDKGenerateImageOutput,
+} from "./instrumentation/plugins/ai-sdk-plugin";
 import { extractOllamaChatInput } from "./instrumentation/plugins/ollama-plugin";
 import { openAIChannels } from "./instrumentation/plugins/openai-channels";
 import { elevenLabsChannels } from "./instrumentation/plugins/elevenlabs-channels";
@@ -52,6 +56,145 @@ const inlineImage = {
   type: "image_url",
   image_url: { url: "data:image/png;base64,AQID" },
 };
+
+it.each([
+  [false, false],
+  [false, true],
+  [true, false],
+  [true, true],
+])(
+  "applies capture=%s to AI SDK image-edit inputs and masks (URL object: %s)",
+  async (captureAttachments, maskAsURL) => {
+    initLogger({ ...loggerOptions, captureAttachments: !captureAttachments });
+    const local = initLogger({
+      ...loggerOptions,
+      setCurrent: false,
+      captureAttachments,
+    });
+    const data = new URL("data:image/png;base64,AQID");
+    const remote = new URL("https://example.com/image.png");
+    const manual = new Attachment({
+      data: "manual",
+      filename: "manual.png",
+      contentType: "image/png",
+    });
+    const prompt = {
+      images: [
+        "AQID",
+        new Uint8Array([1, 2, 3]),
+        data,
+        remote,
+        remote.href,
+        manual,
+      ],
+      mask: maskAsURL ? data : data.href,
+      text: "Edit these images",
+    };
+    const decode = vi.spyOn(globalThis, "atob");
+    const result = await local.traced(() =>
+      processAISDKGenerateImageInput({
+        model: { modelId: "image-model", provider: "test" },
+        prompt,
+      }),
+    );
+    expect(result.input).toHaveProperty(
+      "prompt",
+      captureAttachments
+        ? {
+            images: [
+              expect.any(Attachment),
+              expect.any(Attachment),
+              expect.any(Attachment),
+              remote,
+              remote.href,
+              manual,
+            ],
+            mask: expect.any(Attachment),
+            text: prompt.text,
+          }
+        : { images: [remote, remote.href, manual], text: prompt.text },
+    );
+    if (!captureAttachments) expect(decode).not.toHaveBeenCalled();
+    expect(prompt.images).toHaveLength(6);
+    expect(prompt.mask).toBe(maskAsURL ? data : data.href);
+  },
+);
+
+it("preserves AI SDK image-edit inputs when conversion fails", () => {
+  initLogger({ ...loggerOptions, captureAttachments: true });
+  const prompt = {
+    images: ["not valid base64!"],
+    mask: "not valid base64!",
+    text: "Edit",
+  };
+  const result = processAISDKGenerateImageInput({
+    model: { modelId: "model", provider: "test" },
+    prompt,
+  });
+  expect(result.input).toHaveProperty("prompt", prompt);
+});
+
+it.each([false, true])(
+  "applies capture=%s to AI SDK content parts containing data URL objects",
+  (captureAttachments) => {
+    initLogger({ ...loggerOptions, captureAttachments });
+    const data = new URL("data:image/png;base64,AQID");
+    const content = [
+      { type: "image", image: data },
+      { type: "file", data, mediaType: "image/png" },
+      { type: "image_url", image_url: { url: data } },
+    ];
+    const result = processAISDKCallInput({
+      model: { modelId: "model", provider: "test" },
+      messages: [{ role: "user", content }],
+    });
+    expect(result.input).toHaveProperty("messages", [
+      {
+        role: "user",
+        content: captureAttachments
+          ? [
+              { type: "image", image: expect.any(Attachment) },
+              {
+                type: "file",
+                data: expect.any(Attachment),
+                mediaType: "image/png",
+              },
+              { type: "image_url", image_url: { url: expect.any(Attachment) } },
+            ]
+          : [{ type: "file", mediaType: "image/png" }],
+      },
+    ]);
+  },
+);
+
+it.each(["transcription", "translation"])(
+  "does not expose Groq %s data URLs through filenames",
+  async (operation) => {
+    const local = initLogger({
+      ...loggerOptions,
+      setCurrent: false,
+      captureAttachments: false,
+    });
+    const data = "data:audio/wav;base64,AQID/BAUG";
+    const decode = vi.spyOn(globalThis, "atob");
+    const channel =
+      operation === "transcription"
+        ? groqChannels.audioTranscriptionsCreate
+        : groqChannels.audioTranslationsCreate;
+    await local.traced(() =>
+      channel.tracePromise(async () => ({ text: "hi" }), {
+        arguments: [{ model: "model", file: data }],
+      }),
+    );
+    const rows = await background.drain();
+    const inputs = rows.map((row) => ("input" in row ? row.input : undefined));
+    expect(inputs.find(Boolean)).toMatchObject({
+      content: [{ type: "file", file: { filename: "audio" } }],
+    });
+    expect(JSON.stringify(rows)).not.toContain("BAUG");
+    expect(decode).not.toHaveBeenCalled();
+  },
+);
 
 it.each([true, false])(
   "explicit %s overrides an opposing environment setting",

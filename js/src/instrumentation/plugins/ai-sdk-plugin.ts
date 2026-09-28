@@ -1685,12 +1685,16 @@ const convertImageToAttachment = (
   if (!isAutoCaptureAttachmentsEnabled()) {
     return image instanceof Attachment
       ? image
-      : image instanceof URL ||
+      : (image instanceof URL && image.protocol !== "data:") ||
           (typeof image === "string" && /^https?:/.test(image))
         ? null
         : undefined;
   }
   try {
+    if (image instanceof URL) {
+      if (image.protocol !== "data:") return null;
+      image = image.href;
+    }
     if (typeof image === "string" && image.startsWith("data:")) {
       const [mimeTypeSection, base64Data] = image.split(",");
       const mimeType = mimeTypeSection.match(/data:(.*?);/)?.[1];
@@ -1744,7 +1748,7 @@ const convertDataToAttachment = (
   if (!isAutoCaptureAttachmentsEnabled()) {
     return data instanceof Attachment
       ? data
-      : data instanceof URL ||
+      : (data instanceof URL && data.protocol !== "data:") ||
           (typeof data === "string" && /^https?:/.test(data))
         ? null
         : undefined;
@@ -1752,6 +1756,10 @@ const convertDataToAttachment = (
   if (!mimeType) return null;
 
   try {
+    if (data instanceof URL) {
+      if (data.protocol !== "data:") return null;
+      data = data.href;
+    }
     let blob: Blob | null = null;
 
     if (typeof data === "string" && data.startsWith("data:")) {
@@ -1803,13 +1811,15 @@ export function processAISDKGenerateImageInput(
 
   const processedPrompt = { ...prompt };
   if (Array.isArray(prompt.images)) {
-    processedPrompt.images = prompt.images.map(
-      (image) => convertImageToAttachment(image, "image/png") ?? image,
-    );
+    processedPrompt.images = prompt.images.flatMap((image) => {
+      const attachment = convertImageToAttachment(image, "image/png");
+      return attachment === undefined ? [] : [attachment ?? image];
+    });
   }
   if (prompt.mask !== undefined) {
-    processedPrompt.mask =
-      convertImageToAttachment(prompt.mask, "image/png") ?? prompt.mask;
+    const attachment = convertImageToAttachment(prompt.mask, "image/png");
+    if (attachment === undefined) delete processedPrompt.mask;
+    else processedPrompt.mask = attachment ?? prompt.mask;
   }
 
   return processAISDKCallInput({
