@@ -36,7 +36,7 @@
     "yarn": "please-use-pnpm"
   },
   "devDependencies": {
-    "@changesets/cli": "^2.30.0",
+    "@changesets/cli": "^2.31.1",
     "@changesets/get-github-info": "^0.8.0",
     "@sentry/dotagents": "1.17.0",
     "dotenv": "^17.2.3",
