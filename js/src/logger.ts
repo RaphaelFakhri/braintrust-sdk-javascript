@@ -688,6 +688,9 @@ let stateNonce = 0;
 
 const V1_PROXY_SUFFIX = "/v1/proxy";
 const LOADER_LOGIN_CACHE_MAX = 16;
+const LOGIN_TIMEOUT_MS = 30_000;
+const PROJECT_LOOKUP_TIMEOUT_MS = 30_000;
+const PROJECT_CACHE_TTL_MS = 15 * 60 * 1000;
 
 type ResolvedLoaderLoginOptions = Required<
   Pick<LoginOptions, "apiKey" | "appUrl" | "fetch">
@@ -750,6 +753,11 @@ export class BraintrustState {
   public promptCache: PromptCache;
   public parametersCache: ParametersCache;
   public spanCache: SpanCache;
+  /** @internal */
+  public readonly projectMetadataCache = new LRUCache<
+    string,
+    { promise: Promise<OrgProjectMetadata>; expiresAt: number }
+  >({ max: 1000 });
   private _idGenerator: IDGenerator | null = null;
   private _contextManager: ContextManager | null = null;
   private _otelFlushCallback: (() => Promise<void>) | null = null;
@@ -762,6 +770,12 @@ export class BraintrustState {
 
   private readonly loginParams: LoginOptions;
   private activeLoginOrgNameSelector: string | undefined;
+  private loginGeneration = 0;
+  private loginQueueTail: Promise<void> | undefined;
+  private pendingLogins = new WeakMap<
+    typeof globalThis.fetch,
+    Map<string, Promise<void>>
+  >();
 
   constructor(loginParams: LoginOptions) {
     this.loginParams = { ...loginParams };
@@ -855,6 +869,10 @@ export class BraintrustState {
   }
 
   public resetLoginInfo() {
+    this.loginGeneration++;
+    this.loginQueueTail = undefined;
+    this.pendingLogins = new WeakMap();
+    this.projectMetadataCache.clear();
     this.appUrl = null;
     this.appPublicUrl = null;
     this.loginToken = null;
@@ -1052,6 +1070,7 @@ export class BraintrustState {
   }
 
   public copyLoginInfo(other: BraintrustState) {
+    this.projectMetadataCache.clear();
     this.appUrl = other.appUrl;
     this.appPublicUrl = other.appPublicUrl;
     this.loginToken = other.loginToken;
@@ -1157,6 +1176,9 @@ export class BraintrustState {
   }
 
   public setFetch(fetch: typeof globalThis.fetch) {
+    if (fetch !== this.fetch) {
+      this.projectMetadataCache.clear();
+    }
     this.loginParams.fetch = fetch;
     this.fetch = fetch;
     this._apiConn?.setFetch(fetch);
@@ -1192,13 +1214,88 @@ export class BraintrustState {
     if (this.apiUrl && !loginParams.forceLogin) {
       return;
     }
-    const newState = await loginToState({
+    const generation = this.loginGeneration;
+    const pendingLogins = this.pendingLogins;
+    const options = {
       ...this.loginParams,
       ...Object.fromEntries(
         Object.entries(loginParams).filter(([k, v]) => !isEmpty(v)),
       ),
-    });
-    this.copyLoginInfo(newState);
+    };
+    const appUrl =
+      options.appUrl ??
+      (iso.getEnv("BRAINTRUST_APP_URL") || "https://www.braintrust.dev");
+    const orgName = options.orgName ?? iso.getEnv("BRAINTRUST_ORG_NAME");
+    const fetch = options.fetch ?? globalThis.fetch;
+    const apiKey = options.apiKey ?? (await iso.getBraintrustApiKey());
+    if (generation !== this.loginGeneration) {
+      throw new Error("Login cancelled by a reset.");
+    }
+    // Another attempt may have finished while the credential was being read.
+    if (this.apiUrl && !loginParams.forceLogin) {
+      if (
+        this.appUrl !== appUrl ||
+        this.loginToken !== (apiKey && HTTPConnection.sanitize_token(apiKey)) ||
+        this.activeLoginOrgNameSelector !== orgName ||
+        this.fetch !== fetch
+      ) {
+        throw new Error(
+          "Another login completed with different options during credential discovery. To force re-login, pass `forceLogin: true`.",
+        );
+      }
+      return;
+    }
+
+    let pending = pendingLogins.get(fetch);
+    if (!pending) {
+      pending = new Map();
+      pendingLogins.set(fetch, pending);
+    }
+    const key = JSON.stringify([
+      appUrl,
+      orgName,
+      apiKey,
+      options.debugLogLevel,
+    ]);
+    const existing = pending.get(key);
+    if (!loginParams.forceLogin && existing) {
+      return existing;
+    }
+
+    const previousLogin = this.loginQueueTail;
+    const loginPromise = (async () => {
+      // Each forced login still makes a fresh request, but must not invalidate
+      // the metadata promises of loggers already waiting for another login.
+      if (previousLogin) {
+        await previousLogin.catch(() => {});
+      }
+      if (generation !== this.loginGeneration) {
+        throw new Error("Login cancelled by a reset.");
+      }
+      const newState = await loginToState({
+        ...options,
+        appUrl,
+        orgName,
+        apiKey,
+        fetch,
+      });
+      if (generation !== this.loginGeneration) {
+        throw new Error("Login cancelled by a reset.");
+      }
+      this.copyLoginInfo(newState);
+    })();
+    this.loginQueueTail = loginPromise;
+    pending.set(key, loginPromise);
+    try {
+      await loginPromise;
+    } finally {
+      if (this.loginQueueTail === loginPromise) {
+        this.loginQueueTail = undefined;
+      }
+      if (pending.get(key) === loginPromise) {
+        pending.delete(key);
+      }
+    }
   }
 
   public appConn(): HTTPConnection {
@@ -1658,13 +1755,17 @@ class HTTPConnection {
     object_type: string,
     args: Record<string, string | string[] | undefined> | undefined = undefined,
     retries: number = 0,
+    signal?: AbortSignal,
   ) {
     const tries = retries + 1;
     for (let i = 0; i < tries; i++) {
       try {
-        const resp = await this.get(`${object_type}`, args);
+        const resp = await this.get(`${object_type}`, args, { signal });
         return await readJSONResponse(resp, this.classifyTransportErrors);
       } catch (e) {
+        if (signal?.aborted) {
+          throw getAbortReason(signal);
+        }
         if (i < tries - 1) {
           debugLogger.debug(
             `Retrying API request ${object_type} ${JSON.stringify(args)} ${
@@ -1675,9 +1776,7 @@ class HTTPConnection {
           debugLogger.info(
             `Sleeping for ${sleepTimeS}s before retrying API request`,
           );
-          await new Promise((resolve) =>
-            setTimeout(resolve, sleepTimeS * 1000),
-          );
+          await waitForRetry(sleepTimeS * 1000, signal);
           continue;
         }
         throw e;
@@ -1688,9 +1787,11 @@ class HTTPConnection {
   async post_json(
     object_type: string,
     args: Record<string, unknown> | string | undefined = undefined,
+    signal?: AbortSignal,
   ) {
     const resp = await this.post(`${object_type}`, args, {
       headers: { "Content-Type": "application/json" },
+      signal,
     });
     return await readJSONResponse(resp, this.classifyTransportErrors);
   }
@@ -4937,36 +5038,91 @@ async function computeLoggerMetadata(
 ) {
   await state.login({});
   const org_id = state.orgId!;
-  if (isEmpty(project_id)) {
-    const response = await state.appConn().post_json("api/project/register", {
-      project_name: project_name || GLOBAL_PROJECT,
-      org_id,
-    });
-    return {
-      org_id,
-      project: {
-        id: response.project.id,
-        name: response.project.name,
-        fullInfo: response.project,
-      },
-    };
-  } else if (isEmpty(project_name)) {
-    const response = await state.appConn().get_json("api/project", {
-      id: project_id,
-    });
-    return {
-      org_id,
-      project: {
-        id: project_id,
-        name: response.name,
-        fullInfo: response.project,
-      },
-    };
-  } else {
+  if (!isEmpty(project_id) && !isEmpty(project_name)) {
     return {
       org_id,
       project: { id: project_id, name: project_name, fullInfo: {} },
     };
+  }
+
+  const cache = state.projectMetadataCache;
+  const key = JSON.stringify([
+    state.appUrl,
+    org_id,
+    state.loginToken,
+    isEmpty(project_id)
+      ? ["name", project_name || GLOBAL_PROJECT]
+      : ["id", project_id],
+  ]);
+  const cached = cache.get(key);
+  if (cached && Date.now() < cached.expiresAt) {
+    return structuredClone(await cached.promise);
+  }
+
+  const conn = state.appConn();
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const entry = {
+    // The lookup timeout bounds pending requests; the cache TTL starts on success.
+    expiresAt: Infinity,
+    promise: Promise.race([
+      (async (): Promise<OrgProjectMetadata> => {
+        if (isEmpty(project_id)) {
+          const response = await conn.post_json(
+            "api/project/register",
+            {
+              project_name: project_name || GLOBAL_PROJECT,
+              org_id,
+            },
+            controller.signal,
+          );
+          return {
+            org_id,
+            project: {
+              id: response.project.id,
+              name: response.project.name,
+              fullInfo: response.project,
+            },
+          };
+        }
+        const response = await conn.get_json(
+          "api/project",
+          { id: project_id },
+          0,
+          controller.signal,
+        );
+        return {
+          org_id,
+          project: {
+            id: project_id,
+            name: response.name,
+            fullInfo: response.project,
+          },
+        };
+      })(),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          const error = new Error(
+            "Braintrust project lookup timed out after 30 seconds.",
+          );
+          reject(error);
+          controller.abort(error);
+        }, PROJECT_LOOKUP_TIMEOUT_MS);
+      }),
+    ]),
+  };
+  cache.set(key, entry);
+  try {
+    const metadata = await entry.promise;
+    entry.expiresAt = Date.now() + PROJECT_CACHE_TTL_MS;
+    return structuredClone(metadata);
+  } catch (error) {
+    if (cache.get(key) === entry) {
+      cache.delete(key);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -5727,18 +5883,37 @@ export async function loginToState(options: LoginOptions = {}) {
     _saveOrgInfo(state, testOrgInfo, testOrgInfo[0].name);
     return state;
   } else {
-    const loginResponse = await fetch(
-      _urljoin(state.appUrl, `/api/apikey/login`),
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-      },
-    );
-    const resp = await checkResponse(loginResponse);
-    const info = await readJSONResponse(resp);
+    const controller = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let info;
+    try {
+      // Bound both headers and body reads, including custom fetches that ignore
+      // cancellation, so a stalled request cannot block subsequent logins.
+      info = await Promise.race([
+        (async () => {
+          const response = await fetch(_urljoin(appUrl, `/api/apikey/login`), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${apiKey}`,
+            },
+            signal: controller.signal,
+          });
+          return readJSONResponse(await checkResponse(response));
+        })(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            const error = new Error(
+              "Braintrust login timed out after 30 seconds.",
+            );
+            reject(error);
+            controller.abort(error);
+          }, LOGIN_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
 
     _saveOrgInfo(state, info.org_info, orgName);
     if (!state.apiUrl) {
