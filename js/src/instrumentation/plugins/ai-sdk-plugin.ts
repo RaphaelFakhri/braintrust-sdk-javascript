@@ -3833,10 +3833,7 @@ async function processAISDKStreamingOutput(
     if ("object" in result) {
       const resolvedObject = await Promise.resolve(result.object);
       if (resolvedObject !== undefined) {
-        outputRecord.object = processInputAttachments(
-          resolvedObject,
-          captureAttachments,
-        );
+        outputRecord.object = resolvedObject;
       }
     }
   } catch {
@@ -4007,11 +4004,40 @@ export function processAISDKOutput(
   if (!output) return output;
 
   const merged = extractSerializableOutputFields(output);
+  // Only provider content containers contain media. Structured outputs, tool
+  // arguments, and metadata can use the same field names for ordinary JSON.
+  const processMediaContainers = (
+    container: Record<string, unknown>,
+  ): Record<string, unknown> =>
+    Object.fromEntries(
+      Object.entries(container).map(([key, value]) => {
+        if (
+          ["content", "messages", "responseMessages", "toolResults"].includes(
+            key,
+          ) &&
+          Array.isArray(value)
+        ) {
+          return [key, processInputAttachments(value, captureAttachments)];
+        }
+        if (key === "steps" && Array.isArray(value)) {
+          return [
+            key,
+            value.map((step) =>
+              isObject(step) ? processMediaContainers(step) : step,
+            ),
+          ];
+        }
+        if (key === "response" && isObject(value)) {
+          return [key, processMediaContainers(value)];
+        }
+        return [key, value];
+      }),
+    );
   const deleteOutputPaths = denyOutputPaths.filter((path) =>
     path.toLowerCase().endsWith("headers"),
   );
   const sanitized = omit(
-    processInputAttachments(merged, captureAttachments),
+    processMediaContainers(merged),
     denyOutputPaths,
     deleteOutputPaths,
   );

@@ -165,6 +165,16 @@ export function processInputAttachments(
     }
 
     if (node instanceof BaseAttachment || node instanceof Date) return node;
+    // Tool arguments and JSON results are application data, not content parts.
+    if (node.type === "tool-call") return node;
+    if (node.type === "tool-result") {
+      return node.output?.type === "content" && Array.isArray(node.output.value)
+        ? {
+            ...node,
+            output: { ...node.output, value: processNode(node.output.value) },
+          }
+        : node;
+    }
     if (node instanceof URL) {
       if (node.protocol !== "data:") return node;
       if (!captureAttachments) return undefined;
@@ -185,7 +195,9 @@ export function processInputAttachments(
     if (node.type === "input_image" || node.type === "input_file") {
       const field =
         node.type === "input_file"
-          ? "file_data"
+          ? "file_data" in node
+            ? "file_data"
+            : "file"
           : "image_url" in node
             ? "image_url"
             : "image";

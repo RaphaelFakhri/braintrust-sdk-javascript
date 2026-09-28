@@ -169,64 +169,59 @@ export class OpenAIAgentsTraceProcessor {
       options.maxTraces ?? OpenAIAgentsTraceProcessor.DEFAULT_MAX_TRACES;
   }
 
-  private processInputImages(input: any): any {
+  private processInputMedia(input: any): any {
     if (Array.isArray(input)) {
       return input
-        .map((item) => this.processInputImages(item))
+        .map((item) => this.processInputMedia(item))
         .filter((item) => item !== undefined);
     }
 
     if (input && typeof input === "object") {
-      // Handle input_image type with base64 image data
-      if (input.type === "input_image" && typeof input.image === "string") {
-        if (/^https?:\/\//i.test(input.image)) return input;
+      const field =
+        input.type === "input_image"
+          ? "image_url" in input
+            ? "image_url"
+            : "image"
+          : input.type === "input_file"
+            ? "file_data" in input
+              ? "file_data"
+              : "file"
+            : undefined;
+      if (field && typeof input[field] === "string") {
+        const data = input[field];
+        if (/^https?:\/\//i.test(data)) return input;
         if (
           !_internalGetGlobalState()._internalCaptureAttachmentsEnabled(
             getSpanParentObject(),
           )
         ) {
-          const { image: _image, ...metadata } = input;
+          const { [field]: _data, ...metadata } = input;
           return Object.keys(metadata).some((key) => key !== "type")
             ? metadata
             : undefined;
         }
-        let imageData = input.image;
-
-        // Strip data URI prefix if present (e.g., "data:image/png;base64,")
-        const dataUriMatch = imageData.match(/^data:image\/(\w+);base64,(.*)$/);
-        let contentType = "image/png";
-        let fileExtension = "png";
-
-        if (dataUriMatch) {
-          fileExtension = dataUriMatch[1];
-          contentType = `image/${fileExtension}`;
-          imageData = dataUriMatch[2]; // Extract just the base64 part
-        }
-
-        const filename = `input_image.${fileExtension}`;
-
+        const dataUriMatch = data.match(/^data:([^;,]+);base64,([\s\S]*)$/);
+        const contentType =
+          dataUriMatch?.[1] ??
+          (input.type === "input_image"
+            ? "image/png"
+            : "application/octet-stream");
+        const extension =
+          contentType === "application/octet-stream"
+            ? "bin"
+            : contentType.split("/")[1];
         try {
-          // Convert base64 string to Blob
-          const binaryString = atob(imageData);
-          const bytes = new Uint8Array(binaryString.length);
-          for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-          }
-          const blob = new Blob([bytes], { type: contentType });
-
-          const attachment = new Attachment({
-            data: blob,
-            filename: filename,
-            contentType: contentType,
-          });
-
           return {
             ...input,
-            image: attachment,
+            [field]: new Attachment({
+              data: new Uint8Array(
+                base64ToUint8Array(dataUriMatch?.[2] ?? data),
+              ).buffer,
+              filename: input.filename || `${input.type}.${extension}`,
+              contentType,
+            }),
           };
-        } catch (e) {
-          console.error("Failed to process input image:", e);
-          console.error("Image data sample:", input.image.substring(0, 200));
+        } catch {
           return input;
         }
       }
@@ -234,7 +229,7 @@ export class OpenAIAgentsTraceProcessor {
       // Recursively process nested objects
       const result: any = {};
       for (const [key, value] of Object.entries(input)) {
-        const processed = this.processInputImages(value);
+        const processed = this.processInputMedia(value);
         if (processed !== undefined) result[key] = processed;
       }
       return result;
@@ -427,7 +422,7 @@ export class OpenAIAgentsTraceProcessor {
     }
 
     if (spanData._input !== undefined) {
-      data.input = this.processInputImages(spanData._input);
+      data.input = this.processInputMedia(spanData._input);
     }
 
     if (spanData._response !== undefined) {

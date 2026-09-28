@@ -124,7 +124,16 @@ it.each([true, false])(
       error: null,
       spanData: {
         type: "response",
-        _input: [{ type: "input_image", image: "data:image/png;base64,AQID" }],
+        _input: [
+          { type: "input_image", image: "data:image/png;base64,AQID" },
+          { type: "input_file", file: "data:application/pdf;base64,AQID" },
+          { type: "input_file", file: "https://example.com/report.pdf" },
+          { type: "input_file", file: { id: "file-123" } },
+          {
+            type: "input_file",
+            file: { url: "https://example.com/report.pdf" },
+          },
+        ],
         _response: {
           output: [{ type: "image_generation_call", result: "AQID" }],
         },
@@ -134,8 +143,25 @@ it.each([true, false])(
     await processor.onSpanStart(span);
     initLogger({ ...options, captureAttachments: !captureAttachments });
     await processor.onSpanEnd(span);
+    const expectedInput = [
+      ...(captureAttachments
+        ? [
+            { type: "input_image", image: expect.any(Attachment) },
+            { type: "input_file", file: expect.any(Attachment) },
+          ]
+        : []),
+      { type: "input_file", file: "https://example.com/report.pdf" },
+      { type: "input_file", file: { id: "file-123" } },
+      { type: "input_file", file: { url: "https://example.com/report.pdf" } },
+    ];
+    expect(
+      processor._traceSpans.get(trace.traceId)?.metadata.firstInput,
+    ).toEqual(expectedInput);
     await processor.onTraceEnd(trace);
-    const payload = JSON.stringify(await background.drain());
+    const rows = await background.drain();
+    for (const row of rows.filter((row) => "input" in row))
+      expect(row).toHaveProperty("input", expectedInput);
+    const payload = JSON.stringify(rows);
     if (captureAttachments) expect(payload).toContain("braintrust_attachment");
     else {
       expect(payload).not.toContain("input_image");

@@ -251,7 +251,16 @@ it.each([false, true])(
       error: null,
       spanData: {
         type: "response",
-        _input: [{ type: "input_image", image: "data:image/png;base64,AQID" }],
+        _input: [
+          { type: "input_image", image: "data:image/png;base64,AQID" },
+          { type: "input_file", file: "data:application/pdf;base64,AQID" },
+          { type: "input_file", file: "https://example.com/report.pdf" },
+          { type: "input_file", file: { id: "file-123" } },
+          {
+            type: "input_file",
+            file: { url: "https://example.com/report.pdf" },
+          },
+        ],
         _response: {
           output: [{ type: "image_generation_call", result: "AQID" }],
         },
@@ -271,12 +280,17 @@ it.each([false, true])(
         ? [{ type: "image_generation_call", result: expect.any(Attachment) }]
         : [],
     );
-    expect(output).toHaveProperty(
-      "input",
-      captureAttachments
-        ? [{ type: "input_image", image: expect.any(Attachment) }]
-        : [],
-    );
+    expect(output).toHaveProperty("input", [
+      ...(captureAttachments
+        ? [
+            { type: "input_image", image: expect.any(Attachment) },
+            { type: "input_file", file: expect.any(Attachment) },
+          ]
+        : []),
+      { type: "input_file", file: "https://example.com/report.pdf" },
+      { type: "input_file", file: { id: "file-123" } },
+      { type: "input_file", file: { url: "https://example.com/report.pdf" } },
+    ]);
     expect(
       processor._traceSpans.get(trace.traceId)?.metadata.lastOutput,
     ).toEqual(output && "output" in output ? output.output : undefined);
@@ -865,3 +879,71 @@ it("preserves a deferred instrumentation policy when a different logger supplies
   child.end();
   deferred.end();
 });
+
+it.each([false, true])(
+  "preserves AI SDK application JSON that resembles media (capture=%s)",
+  async (captureAttachments) => {
+    const logger = initLogger({ ...loggerOptions, captureAttachments });
+    const object = { type: "file", data: "report text" };
+    const toolCall = {
+      type: "tool-call",
+      toolCallId: "call",
+      toolName: "report",
+      input: object,
+      args: object,
+    };
+    const toolResult = {
+      type: "tool-result",
+      toolCallId: "call",
+      toolName: "report",
+      input: object,
+      output: { type: "json", value: object },
+      result: object,
+    };
+    const messages = [
+      { role: "assistant", content: [toolCall] },
+      { role: "tool", content: [toolResult] },
+    ];
+    const result = {
+      object,
+      output: object,
+      content: [toolCall, toolResult],
+      toolCalls: [toolCall],
+      toolResults: [toolResult],
+      response: { messages },
+      steps: [{ content: [toolCall, toolResult], providerMetadata: object }],
+      providerMetadata: object,
+    };
+    expect(processAISDKOutput(result, [], captureAttachments)).toEqual(result);
+    expect(
+      processAISDKCallInput({
+        model: { modelId: "test", provider: "test" },
+        messages,
+      }).input,
+    ).toHaveProperty("messages", messages);
+
+    const span = logger.startSpan({ name: "structured stream" });
+    const streamResult = {
+      partialObjectStream: (async function* () {
+        yield object;
+      })(),
+      object: Promise.resolve(object),
+    };
+    expect(
+      patchAISDKStreamingResult({
+        defaultDenyOutputPaths: [],
+        endEvent: {},
+        result: streamResult,
+        span,
+        startTime: Date.now() / 1000,
+      }),
+    ).toBe(true);
+    for await (const chunk of streamResult.partialObjectStream)
+      expect(chunk).toEqual(object);
+    const rows = await background.drain();
+    expect(rows.find((row) => "output" in row)).toHaveProperty(
+      "output.object",
+      object,
+    );
+  },
+);
