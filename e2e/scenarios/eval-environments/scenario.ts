@@ -97,15 +97,24 @@ async function main() {
               scored++;
               return 1;
             },
-            async function independentCopy({ input, snapshots }) {
+            async function independentCopy(args) {
+              const { input, snapshots } = args;
               await Promise.resolve();
               assert.equal(snapshots.seeded?.count, input);
+              const serialized = JSON.parse(JSON.stringify(args));
+              assert.equal("environment" in serialized, false);
+              assert.equal("snapshots" in serialized, false);
+              assert.equal(serialized.input, input);
               return 1;
             },
           ],
           classifiers: [
-            function completed({ snapshots, input }) {
+            function completed(args) {
+              const { snapshots, input } = args;
               assert.equal(snapshots.seeded?.count, input);
+              const serialized = JSON.parse(JSON.stringify(args));
+              assert.equal("environment" in serialized, false);
+              assert.equal("snapshots" in serialized, false);
               return { name: "completion", id: "done", label: "Done" };
             },
           ],
@@ -119,6 +128,9 @@ async function main() {
       for (const item of result.results) {
         assert.equal(item.error, undefined);
         assert.deepEqual(item.scores, { stateChanged: 1, independentCopy: 1 });
+        assert.deepEqual(item.classifications?.completion, [
+          { id: "done", label: "Done" },
+        ]);
         assert.equal("environment" in item, false);
         assert.equal("snapshots" in item, false);
       }
@@ -127,6 +139,32 @@ async function main() {
       });
     },
     { name: "environment-root", event: { metadata: { scenario, testRunId } } },
+  );
+  await logger.traced(
+    async (root) => {
+      const result = await Eval(
+        "cleanup failures",
+        {
+          state: logger.loggingState,
+          data: [{ input: "cleanup failure" }],
+          task: (_, { onCleanup }) => {
+            onCleanup(() => {
+              throw new Error("session cleanup failed", {
+                cause: new Error("service disconnected"),
+              });
+            });
+            throw new Error("task operation failed");
+          },
+          scores: [],
+        },
+        { parent: await root.export() },
+      );
+      assert(result.results[0].error instanceof AggregateError);
+    },
+    {
+      name: "cleanup-failure-root",
+      event: { metadata: { scenario, testRunId } },
+    },
   );
   await logger.flush();
 }

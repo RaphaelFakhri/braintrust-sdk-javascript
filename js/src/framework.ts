@@ -184,21 +184,21 @@ export interface EvalHooks<
 }
 
 // This happens to be compatible with ScorerArgs defined in "../util".
-// Keep standalone scorer calls compatible when no snapshot schemas are specified.
+// Standalone scorers only require explicitly declared environment and snapshot types.
 export type EvalScorerArgs<
   Input,
   Output,
   Expected,
   Metadata extends BaseMetadata = DefaultMetadataType,
-  Environment = undefined,
+  Environment = never,
   Schemas extends SnapshotSchemas = never,
 > = EvalCase<Input, Expected, Metadata> & {
   output: Output;
   trace?: Trace;
-} & ([Schemas] extends [never]
+} & ([Environment] extends [never] ? object : { environment: Environment }) &
+  ([Schemas] extends [never]
     ? object
     : {
-        environment: Environment;
         snapshots: Snapshots<Schemas>;
       });
 
@@ -209,7 +209,7 @@ export type EvalScorer<
   Output,
   Expected,
   Metadata extends BaseMetadata = DefaultMetadataType,
-  Environment = undefined,
+  Environment = never,
   Schemas extends SnapshotSchemas = never,
 > = (
   args: EvalScorerArgs<Input, Output, Expected, Metadata, Environment, Schemas>,
@@ -222,7 +222,7 @@ export type EvalClassifier<
   Output,
   Expected,
   Metadata extends BaseMetadata = DefaultMetadataType,
-  Environment = undefined,
+  Environment = never,
   Schemas extends SnapshotSchemas = never,
 > = (
   args: EvalScorerArgs<Input, Output, Expected, Metadata, Environment, Schemas>,
@@ -612,6 +612,11 @@ export function callEvaluatorData<
   baseExperiment: string | undefined;
 } {
   const dataResult = typeof data === "function" ? data() : data;
+  if (dataResult instanceof Promise) {
+    // Data loading starts before experiment and environment setup. Observe a
+    // rejection now; the original promise still propagates it when awaited.
+    void dataResult.catch(() => {});
+  }
 
   let baseExperiment: string | undefined = undefined;
   if ("_type" in dataResult && dataResult._type === "BaseExperiment") {
@@ -1345,6 +1350,12 @@ export async function runEvaluator(
           evaluator.timeout,
         );
   const errors: unknown[] = [];
+  const pendingData =
+    evaluator.data instanceof Promise
+      ? evaluator.data.catch((error: unknown) => {
+          errors.push(error);
+        })
+      : undefined;
   let result: EvalResultWithSummary<any, any, any, any> | undefined;
   try {
     controller.signal.throwIfAborted();
@@ -1366,13 +1377,23 @@ export async function runEvaluator(
       controller,
     );
   } catch (error) {
-    errors.push(error);
+    if (!errors.includes(error)) errors.push(error);
+    controller.abort(error);
   } finally {
+    await pendingData;
     errors.push(...(await scope.close()));
     if (timeoutId !== undefined) clearTimeout(timeoutId);
     evaluator.signal?.removeEventListener("abort", abort);
   }
-  if (controller.signal.aborted && !errors.includes(controller.signal.reason)) {
+  if (
+    controller.signal.aborted &&
+    !errors.some(
+      (error) =>
+        error === controller.signal.reason ||
+        (error instanceof AggregateError &&
+          error.errors.includes(controller.signal.reason)),
+    )
+  ) {
     errors.unshift(controller.signal.reason);
   }
   if (errors.length === 1) throw errors[0];
@@ -1627,11 +1648,20 @@ async function runEvaluatorInternal(
                     scoringArgsForLogging,
                     async (span) => {
                       const scoreValue = await Promise.resolve(
-                        score({
-                          ...scoringArgs,
-                          environment,
-                          snapshots: scope.copySnapshots(),
-                        }),
+                        score(
+                          Object.defineProperties(
+                            {
+                              ...scoringArgs,
+                              environment,
+                              snapshots: scope.copySnapshots(),
+                            },
+                            {
+                              // Local resources must not reach remote scorers or logs.
+                              environment: { enumerable: false },
+                              snapshots: { enumerable: false },
+                            },
+                          ),
+                        ),
                       );
                       const prepared = _internalPrepareEvaluatorScore(
                         scoreValue,
@@ -1658,11 +1688,19 @@ async function runEvaluatorInternal(
                     scoringArgsForLogging,
                     async (span) => {
                       const classifierValue = await Promise.resolve(
-                        classifier({
-                          ...scoringArgs,
-                          environment,
-                          snapshots: scope.copySnapshots(),
-                        }),
+                        classifier(
+                          Object.defineProperties(
+                            {
+                              ...scoringArgs,
+                              environment,
+                              snapshots: scope.copySnapshots(),
+                            },
+                            {
+                              environment: { enumerable: false },
+                              snapshots: { enumerable: false },
+                            },
+                          ),
+                        ),
                       );
                       const prepared = _internalPrepareEvaluatorClassification(
                         classifierValue,
@@ -1855,10 +1893,13 @@ async function runEvaluatorInternal(
     } catch (e) {
       cancelled = true;
       controller.abort(e);
-      // Drop pending work, but preserve drain listeners until active trials and
-      // their cleanup have finished. Shared resources must outlive every trial.
+      // Shared resources must outlive both active trials and the data iterator,
+      // including its return/finally cleanup when the cancelled loop breaks.
       q.remove(() => true);
-      if (!q.idle()) await q.drain();
+      const [dataResult] = await Promise.allSettled([
+        enqueuePromise,
+        ...(q.idle() ? [] : [q.drain()]),
+      ]);
       q.kill();
 
       if (e instanceof InternalAbortError) {
@@ -1870,6 +1911,12 @@ async function runEvaluatorInternal(
         }
       }
 
+      if (dataResult.status === "rejected" && dataResult.reason !== e) {
+        throw new AggregateError(
+          [e, dataResult.reason],
+          "Eval cancellation and data iteration failed",
+        );
+      }
       throw e;
     } finally {
       controller.signal.removeEventListener("abort", abortHandler!);

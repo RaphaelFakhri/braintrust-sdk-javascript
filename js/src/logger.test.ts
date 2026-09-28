@@ -21,6 +21,8 @@ import {
   deepCopyEvent,
   ReadonlyExperiment,
   renderMessageImpl,
+  logError,
+  NOOP_SPAN,
 } from "./logger";
 
 import { configureNode } from "./node/config";
@@ -43,6 +45,33 @@ import { DiskCache } from "./prompt-cache/disk-cache";
 import { LRUCache } from "./lru-cache";
 
 configureNode();
+
+test("logError preserves nested aggregate errors and causes without looping on cycles", () => {
+  const taskError = new Error("task failed");
+  const cause = new Error("connection closed");
+  const cleanupError = new Error("cleanup failed", { cause });
+  const aggregate = new AggregateError(
+    [
+      taskError,
+      new AggregateError([cleanupError, "non-Error failure"], "cleanup"),
+    ],
+    "Eval task cleanup failed",
+  );
+  cause.cause = aggregate;
+  const log = vi.spyOn(NOOP_SPAN, "log");
+  try {
+    logError(NOOP_SPAN, aggregate);
+    expect(log).toHaveBeenCalledOnce();
+    const loggedError = log.mock.calls[0][0].error;
+    for (const error of [aggregate, taskError, cleanupError, cause]) {
+      expect(loggedError).toContain(error.message);
+      expect(loggedError).toContain(error.stack);
+    }
+    expect(loggedError).toContain("non-Error failure");
+  } finally {
+    log.mockRestore();
+  }
+});
 
 test("renderMessage renders templates in structured content parts", () => {
   const message = {

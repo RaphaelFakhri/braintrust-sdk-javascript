@@ -1,6 +1,13 @@
 import { beforeAll, describe, expect, expectTypeOf, test, vi } from "vitest";
 import { z } from "zod/v3";
-import { Eval, defaultErrorScoreHandler, runEvaluator } from "./framework";
+import {
+  Eval,
+  callEvaluatorData,
+  defaultErrorScoreHandler,
+  runEvaluator,
+  type EvalScorer,
+  type EvalClassifier,
+} from "./framework";
 import { EvalScope } from "./eval-environment";
 import { configureNode } from "./node/config";
 
@@ -11,6 +18,41 @@ const options = {
 };
 
 describe("eval environments and snapshots", () => {
+  test("standalone scorers and classifiers can declare an environment without snapshots", async () => {
+    type Environment = { count: number };
+    const score: EvalScorer<number, number, void, {}, Environment> = ({
+      environment,
+      output,
+    }) => {
+      expectTypeOf(environment).toEqualTypeOf<Environment>();
+      return Number(environment.count === output);
+    };
+    const classifier: EvalClassifier<number, number, void, {}, Environment> = ({
+      environment,
+    }) => {
+      expectTypeOf(environment).toEqualTypeOf<Environment>();
+      return { name: "count", id: String(environment.count) };
+    };
+    const plainScorer: EvalScorer<number, number, void, {}> = ({ output }) =>
+      Number(output === 1);
+    const result = await Eval(
+      "environment-only scorers",
+      {
+        data: [{ input: 1, metadata: {} }],
+        environment: () => ({ count: 1 }),
+        task: (input) => input,
+        scores: [score, plainScorer],
+        classifiers: [classifier],
+      },
+      options,
+    );
+    expect(result.results[0].error).toBeUndefined();
+    expect(result.results[0].scores).toEqual({ score: 1, plainScorer: 1 });
+    expect(result.results[0].classifications).toEqual({
+      count: [{ id: "1", label: "1" }],
+    });
+  });
+
   test("infers environment, capture inputs, and optional transformed outputs", async () => {
     const result = await Eval(
       "typed snapshots",
@@ -397,6 +439,86 @@ describe("eval environments and snapshots", () => {
     ).rejects.toThrow("shared close");
   });
 
+  test("observes data factory rejections before evaluator initialization", async () => {
+    const dataError = new Error("data failed");
+    const { data } = callEvaluatorData(async () => {
+      throw dataError;
+    });
+    // Leave a full event-loop turn before consuming the data, as asynchronous
+    // experiment initialization does. Vitest reports unhandled rejections.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(data).rejects.toBe(dataError);
+  });
+
+  test.each([false, true])(
+    "preserves data errors during pending environment setup (setup fails: %s)",
+    async (setupFails) => {
+      const dataError = new Error("data failed");
+      const setupError = new Error("setup failed");
+      const cleanup = vi.fn();
+      const task = vi.fn();
+      const failure = await Eval(
+        "data failure during setup",
+        {
+          data: async () => {
+            throw dataError;
+          },
+          environment: async ({ onCleanup }) => {
+            onCleanup(cleanup);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            if (setupFails) throw setupError;
+          },
+          task,
+          scores: [],
+        },
+        options,
+      ).catch((error: unknown) => error);
+      if (setupFails) {
+        expect(failure).toBeInstanceOf(AggregateError);
+        expect((failure as AggregateError).errors).toEqual([
+          dataError,
+          setupError,
+        ]);
+      } else {
+        expect(failure).toBe(dataError);
+      }
+      expect(cleanup).toHaveBeenCalledOnce();
+      expect(task).not.toHaveBeenCalled();
+    },
+  );
+
+  test("cancellation during setup waits for pending data and preserves its failure", async () => {
+    const controller = new AbortController();
+    const dataError = new Error("data failed after cancellation");
+    const events: string[] = [];
+    const failure = await Eval(
+      "pending data cancellation",
+      {
+        signal: controller.signal,
+        data: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          events.push("data finished");
+          throw dataError;
+        },
+        environment: ({ onCleanup }) => {
+          onCleanup(() => {
+            events.push("shared cleanup");
+          });
+          controller.abort();
+        },
+        task: () => 1,
+        scores: [],
+      },
+      options,
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "Evaluator aborted" }),
+      dataError,
+    ]);
+    expect(events).toEqual(["data finished", "shared cleanup"]);
+  });
+
   test("CLI discovery does not acquire resources", async () => {
     const environment = vi.fn();
     const previous = globalThis._lazy_load;
@@ -551,6 +673,83 @@ describe("eval environments and snapshots", () => {
     ).rejects.toThrow("iterator failed");
     expect(events).toEqual(["task cleanup", "shared cleanup"]);
   });
+
+  test.each([false, true])(
+    "cancellation waits for pending iteration and iterator cleanup (cleanup fails: %s)",
+    async (cleanupFails) => {
+      const controller = new AbortController();
+      const iteratorError = new Error("iterator cleanup failed");
+      const events: string[] = [];
+      let finishRead!: () => void;
+      const pendingRead = new Promise<void>((resolve) => {
+        finishRead = resolve;
+      });
+      let reading!: () => void;
+      const readStarted = new Promise<void>((resolve) => {
+        reading = resolve;
+      });
+      let started!: () => void;
+      const taskStarted = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const cleanup = vi.fn(() => {
+        events.push("shared cleanup");
+      });
+      const task = vi.fn((input: number) => {
+        started();
+        return input;
+      });
+      const run = Eval(
+        "cancel pending iteration",
+        {
+          signal: controller.signal,
+          data: (async function* () {
+            try {
+              yield { input: 1 };
+              reading();
+              await pendingRead;
+              events.push("read finished");
+              yield { input: 2 };
+            } finally {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+              events.push("iterator cleanup");
+              if (cleanupFails) throw iteratorError;
+            }
+          })(),
+          environment: ({ onCleanup }) => {
+            onCleanup(cleanup);
+          },
+          task,
+          scores: [],
+        },
+        options,
+      ).catch((error: unknown) => error);
+      await Promise.all([readStarted, taskStarted]);
+      controller.abort();
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(cleanup).not.toHaveBeenCalled();
+      } finally {
+        finishRead();
+      }
+      const failure = await run;
+      if (cleanupFails) {
+        expect(failure).toBeInstanceOf(AggregateError);
+        expect((failure as AggregateError).errors).toEqual([
+          expect.objectContaining({ message: "Evaluator aborted" }),
+          iteratorError,
+        ]);
+      } else {
+        expect(failure).toMatchObject({ message: "Evaluator aborted" });
+      }
+      expect(task).toHaveBeenCalledOnce();
+      expect(events).toEqual([
+        "read finished",
+        "iterator cleanup",
+        "shared cleanup",
+      ]);
+    },
+  );
 });
 
 test("cancellation waits for active scoring before cleanup", async () => {

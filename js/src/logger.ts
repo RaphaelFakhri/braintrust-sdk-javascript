@@ -6437,15 +6437,21 @@ function parentSpanIdsUsable(
 }
 
 export function logError(span: Span, error: unknown) {
-  let errorMessage = "<error>";
-  let stackTrace = "";
-  if (error instanceof Error) {
-    errorMessage = error.message;
-    stackTrace = error.stack || "";
-  } else {
-    errorMessage = String(error);
+  const errors = [error];
+  const seen = new Set<unknown>();
+  const messages: string[] = [];
+  for (const current of errors) {
+    if (seen.has(current)) continue;
+    seen.add(current);
+    if (current instanceof Error) {
+      messages.push(`${current.message}\n\n${current.stack || ""}`);
+      if (current instanceof AggregateError) errors.push(...current.errors);
+      if (current.cause !== undefined) errors.push(current.cause);
+    } else {
+      messages.push(`${String(current)}\n\n`);
+    }
   }
-  span.log({ error: `${errorMessage}\n\n${stackTrace}` });
+  span.log({ error: messages.join("\n\n") });
 }
 
 /**

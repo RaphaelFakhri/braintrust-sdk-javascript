@@ -106,6 +106,7 @@ Without captures, `snapshots` is `{}`.
 Shared `environment` values stay live and are not copied.
 
 Neither the live environment nor snapshots are automatically logged, added to scorer span inputs, or returned in `EvalResult`.
+The `environment` and `snapshots` properties on scorer and classifier arguments are non-enumerable, so JSON serialization and object spreads omit them, including when passing arguments to remote scorers.
 Use the existing span logging APIs to persist selected state explicitly.
 
 ## Task resources do not require an environment
@@ -138,7 +139,7 @@ The environment factory runs once, even when data is empty or filters select no 
 CLI discovery only registers the evaluator and does not run the factory.
 Each task invocation, including each repeated trial, owns a separate cleanup stack.
 Task cleanup finishes after scoring and before releasing the concurrency slot.
-Shared cleanup runs after all active tasks, scorers, and task cleanup have finished.
+Shared cleanup runs after all active tasks, scorers, data loading and iteration, and their cleanup have finished.
 
 Cleanup callbacks run in reverse registration order and may be synchronous or asynchronous.
 Every callback is awaited, even if another callback fails.
@@ -149,7 +150,7 @@ An environment setup or cleanup failure rejects `Eval`; multiple run and cleanup
 Timeouts start before environment setup.
 Timeouts and external aborts stop pending work and abort the shared cooperative `signal`.
 `Eval` waits for active work and cleanup before rejecting, including when there is no environment factory.
-Tasks or setup functions that ignore cancellation can exceed the timeout.
+Tasks, data sources, or setup functions that ignore cancellation can exceed the timeout.
 Cleanup should not depend on an already-aborted signal.
 
 This lifecycle API applies to ordinary `Eval` runs.
