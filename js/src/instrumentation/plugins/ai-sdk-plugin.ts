@@ -18,7 +18,10 @@ import { getCurrentUnixTimestamp } from "../../util";
 import {
   _internalStartSpanWithInitialMerge,
   Attachment,
+  BaseAttachment,
+  CAPTURE_ATTACHMENTS,
   currentSpan,
+  deepCopyEvent,
   startSpan,
   type Span,
   withCurrent,
@@ -32,6 +35,7 @@ import {
   getExtensionFromMediaType,
   isAutoCaptureAttachmentsEnabled,
   omitMediaData,
+  processInputAttachments,
 } from "../../wrappers/attachment-utils";
 import { normalizeAISDKLoggedOutput } from "../../wrappers/ai-sdk/normalize-logged-output";
 import { serializeAISDKToolsForLogging } from "../../wrappers/ai-sdk/tool-serialization";
@@ -916,6 +920,9 @@ function subscribeToHarnessContinuation(
         result: AISDKResult | AsyncIterable<unknown>;
       };
       const span = {
+        [CAPTURE_ATTACHMENTS]: isAutoCaptureAttachmentsEnabled(
+          typeof parent === "string" ? undefined : parent,
+        ),
         end: () => endHarnessTurn(parent),
         log: (update: Parameters<Span["log"]>[0]) =>
           updateHarnessTurn(
@@ -978,6 +985,7 @@ function subscribeToHarnessContinuation(
           output: processAISDKOutput(
             endEvent.result,
             resolveDenyOutputPaths(endEvent, defaultDenyOutputPaths),
+            isAutoCaptureAttachmentsEnabled(span),
           ),
         });
         span.end();
@@ -1069,6 +1077,7 @@ function interceptAISDKModelGenerate(
           output: processAISDKOutput(
             result,
             additional.denyOutputPaths ?? defaultDenyOutputPaths,
+            isAutoCaptureAttachmentsEnabled(span),
           ),
           metrics,
           ...mergeMetadataPayload(
@@ -1148,6 +1157,7 @@ function interceptAISDKModelStream(
           output: processAISDKOutput(
             aggregatedResult,
             additional.denyOutputPaths ?? defaultDenyOutputPaths,
+            isAutoCaptureAttachmentsEnabled(span),
           ),
           metrics,
           ...mergeMetadataPayload(
@@ -1618,6 +1628,8 @@ const processContentPart = (part: any): any => {
   if (!part || typeof part !== "object") return part;
 
   try {
+    if (part.type === "tool-result") return processInputAttachments(part);
+
     if (part.type === "image" && part.image) {
       const imageAttachment = convertImageToAttachment(
         part.image,
@@ -2263,7 +2275,11 @@ function sanitizeAISDKCallInputValue(value: unknown, depth = 0): unknown {
     return undefined;
   }
 
-  if (value === null || typeof value !== "object") {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    value instanceof BaseAttachment
+  ) {
     return value;
   }
 
@@ -2360,7 +2376,11 @@ function sanitizeAISDKMetadataValue(value: unknown, depth = 0): unknown {
     return "[Function]";
   }
 
-  if (value === null || typeof value !== "object") {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    value instanceof BaseAttachment
+  ) {
     return value;
   }
 
@@ -2850,6 +2870,7 @@ function prepareAISDKChildTracing(
             output: processAISDKOutput(
               output as AISDKResult,
               activeEntry.denyOutputPaths,
+              isAutoCaptureAttachmentsEnabled(span),
             ),
             metrics,
             ...mergeMetadataPayload(metadataPayload, missingUsageMetadata),
@@ -3338,6 +3359,7 @@ export function patchAISDKStreamingResult(args: {
   }
 
   const resultRecord = result as Record<string, unknown>;
+  const captureAttachments = isAutoCaptureAttachmentsEnabled(span);
   attachKnownResultPromiseHandlers(resultRecord);
   let finalized = false;
   const finalize = (
@@ -3420,6 +3442,7 @@ export function patchAISDKStreamingResult(args: {
       const processedOutput = await processAISDKStreamingOutput(
         result,
         resolveDenyOutputPaths(endEvent, defaultDenyOutputPaths),
+        captureAttachments,
       );
       const output = transformOutput
         ? transformOutput(processedOutput)
@@ -3775,8 +3798,13 @@ function createPatchedAsyncIterable(
 async function processAISDKStreamingOutput(
   result: AISDKResult,
   denyOutputPaths: string[],
+  captureAttachments: boolean,
 ): Promise<Record<string, unknown> | AISDKResult> {
-  const output = processAISDKOutput(result, denyOutputPaths);
+  const output = processAISDKOutput(
+    result,
+    denyOutputPaths,
+    captureAttachments,
+  );
 
   if (!output || typeof output !== "object") {
     return output;
@@ -3805,7 +3833,10 @@ async function processAISDKStreamingOutput(
     if ("object" in result) {
       const resolvedObject = await Promise.resolve(result.object);
       if (resolvedObject !== undefined) {
-        outputRecord.object = resolvedObject;
+        outputRecord.object = processInputAttachments(
+          resolvedObject,
+          captureAttachments,
+        );
       }
     }
   } catch {
@@ -3971,6 +4002,7 @@ function isAsyncGenerator(value: unknown): value is AsyncGenerator {
 export function processAISDKOutput(
   output: AISDKResult,
   denyOutputPaths: string[],
+  captureAttachments = isAutoCaptureAttachmentsEnabled(),
 ): Record<string, unknown> | AISDKResult {
   if (!output) return output;
 
@@ -3978,7 +4010,11 @@ export function processAISDKOutput(
   const deleteOutputPaths = denyOutputPaths.filter((path) =>
     path.toLowerCase().endsWith("headers"),
   );
-  const sanitized = omit(merged, denyOutputPaths, deleteOutputPaths);
+  const sanitized = omit(
+    processInputAttachments(merged, captureAttachments),
+    denyOutputPaths,
+    deleteOutputPaths,
+  );
 
   // Transport payloads can contain nested provider request/response headers; keep
   // user/model/tool payload fields named "headers" outside these roots intact.
@@ -4458,13 +4494,6 @@ function extractGatewayRoutingInfo(result: AISDKResult): {
 }
 
 /**
- * Deep copy an object via JSON serialization.
- */
-function deepCopy(obj: Record<string, unknown>): Record<string, unknown> {
-  return JSON.parse(JSON.stringify(obj));
-}
-
-/**
  * Parse a JSON path string into an array of keys.
  */
 function parsePath(path: string): (string | number)[] {
@@ -4563,7 +4592,7 @@ function omit(
   paths: string[],
   deletePaths: string[] = [],
 ): Record<string, unknown> {
-  const result = deepCopy(obj);
+  const result = deepCopyEvent({ output: obj }).output;
   const deletePathSet = new Set(deletePaths);
 
   for (const path of paths) {

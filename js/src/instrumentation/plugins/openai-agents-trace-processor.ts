@@ -6,7 +6,10 @@ import {
   NOOP_SPAN,
   currentSpan,
   startSpan as startBaseSpan,
+  withCurrent,
 } from "../../logger";
+import { processInputAttachments } from "../../wrappers/attachment-utils";
+import { processImagesInOutput } from "./openai-span-data";
 import {
   INSTRUMENTATION_NAMES,
   withSpanInstrumentationName,
@@ -325,7 +328,16 @@ export class OpenAIAgentsTraceProcessor {
       return Promise.resolve();
     }
 
-    const logData = this.extractLogData(span);
+    const logData = withCurrent(braintrustSpan, () => {
+      const data = this.extractLogData(span);
+      if (data.input !== undefined)
+        data.input = processInputAttachments(data.input);
+      if (data.output !== undefined)
+        data.output = processInputAttachments(
+          processImagesInOutput(data.output),
+        );
+      return data;
+    });
     braintrustSpan.log({
       error: span.error,
       ...logData,
@@ -493,7 +505,10 @@ export class OpenAIAgentsTraceProcessor {
     spanData: OpenAIAgentsTranscriptionSpanData,
   ): Record<string, unknown> {
     return {
-      input: spanData.input,
+      input: processInputAttachments({
+        type: "input_audio",
+        input_audio: spanData.input,
+      })?.input_audio,
       output: spanData.output,
       metadata: {
         model: spanData.model,
@@ -507,7 +522,10 @@ export class OpenAIAgentsTraceProcessor {
   ): Record<string, unknown> {
     return {
       input: spanData.input,
-      output: spanData.output,
+      output: processInputAttachments({
+        type: "input_audio",
+        input_audio: spanData.output,
+      })?.input_audio,
       metadata: {
         model: spanData.model,
         model_config: spanData.model_config,

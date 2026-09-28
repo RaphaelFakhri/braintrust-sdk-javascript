@@ -21,7 +21,12 @@ import {
   processAISDKCallInput,
   processAISDKGenerateImageInput,
   processAISDKGenerateImageOutput,
+  processAISDKOutput,
+  patchAISDKStreamingResult,
 } from "./instrumentation/plugins/ai-sdk-plugin";
+import { OpenAIAgentsTraceProcessor } from "./instrumentation/plugins/openai-agents-trace-processor";
+import type { OpenAIAgentsSpan } from "./vendor-sdk-types/openai-agents";
+import { googleGenerativeAIChannels } from "./instrumentation/plugins/google-generative-ai-channels";
 import { extractOllamaChatInput } from "./instrumentation/plugins/ollama-plugin";
 import { openAIChannels } from "./instrumentation/plugins/openai-channels";
 import { elevenLabsChannels } from "./instrumentation/plugins/elevenlabs-channels";
@@ -56,6 +61,354 @@ const inlineImage = {
   type: "image_url",
   image_url: { url: "data:image/png;base64,AQID" },
 };
+
+it.each([false, true])(
+  "processes native OpenAI media with capture=%s",
+  (captureAttachments) => {
+    const input = [
+      {
+        type: "input_image",
+        image_url: "data:image/png;base64,AQID",
+        detail: "low",
+      },
+      { type: "input_image", image: "data:image/png;base64,AQID" },
+      { type: "input_file", file_data: "AQID", filename: "document.pdf" },
+      { type: "input_audio", input_audio: { data: "AQID", format: "wav" } },
+      { type: "input_image", image_url: "https://example.com/image.png" },
+      { type: "input_file", file_id: "file-123" },
+    ];
+    const result = processInputAttachments(input, captureAttachments);
+    expect(result).toEqual([
+      {
+        type: "input_image",
+        detail: "low",
+        ...(captureAttachments ? { image_url: expect.any(Attachment) } : {}),
+      },
+      ...(captureAttachments
+        ? [{ type: "input_image", image: expect.any(Attachment) }]
+        : []),
+      {
+        type: "input_file",
+        filename: "document.pdf",
+        ...(captureAttachments ? { file_data: expect.any(Attachment) } : {}),
+      },
+      {
+        type: "input_audio",
+        input_audio: {
+          format: "wav",
+          ...(captureAttachments ? { data: expect.any(Attachment) } : {}),
+        },
+      },
+      ...input.slice(4),
+    ]);
+    expect(input[2].file_data).toBe("AQID");
+  },
+);
+
+it.each([false, true])(
+  "applies the owning policy to AI SDK tool-result media (%s)",
+  async (captureAttachments) => {
+    initLogger({ ...loggerOptions, captureAttachments: !captureAttachments });
+    const local = initLogger({
+      ...loggerOptions,
+      setCurrent: false,
+      captureAttachments,
+    });
+    const media = ["image-data", "file-data", "media"].map((type) => ({
+      type,
+      data: "AQID",
+      mediaType: "image/png",
+    }));
+    const references = [
+      { type: "text", text: "Screenshot captured" },
+      { type: "image-url", url: "https://example.com/image.png" },
+      { type: "file-id", fileId: "file-123" },
+    ];
+    const toolResult = {
+      type: "tool-result",
+      toolCallId: "call-1",
+      toolName: "screenshot",
+      output: { type: "content", value: [...media, ...references] },
+    };
+    const messages = [{ role: "tool", content: [toolResult] }];
+    const decode = vi.spyOn(globalThis, "atob");
+    await local.traced(() => {
+      const input = processAISDKCallInput({
+        model: { modelId: "model", provider: "test" },
+        messages,
+      }).input;
+      const output = processAISDKOutput({ response: { messages } }, []);
+      const expected = [
+        ...media.map(({ data: _data, ...part }) => ({
+          ...part,
+          ...(captureAttachments ? { data: expect.any(Attachment) } : {}),
+        })),
+        ...references,
+      ];
+      expect(input).toHaveProperty(
+        "messages.0.content.0.output.value",
+        expected,
+      );
+      expect(output).toHaveProperty(
+        "response.messages.0.content.0.output.value",
+        expected,
+      );
+    });
+    if (!captureAttachments) expect(decode).not.toHaveBeenCalled();
+    expect(toolResult.output.value).toEqual([...media, ...references]);
+    expect(media.every((part) => part.data === "AQID")).toBe(true);
+  },
+);
+
+it.each([false, true])(
+  "processes AI SDK media throughout output containers with capture=%s",
+  (captureAttachments) => {
+    initLogger({ ...loggerOptions, captureAttachments });
+    const readBytes = vi.fn(() => "AQID");
+    const generatedFile = {
+      mediaType: "image/png",
+      get base64() {
+        return readBytes();
+      },
+    };
+    const file = { type: "file", file: generatedFile };
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "file", mediaType: "image/png", data: "AQID" },
+        { type: "text", text: "Done" },
+      ],
+    };
+    const result = processAISDKOutput(
+      {
+        content: [file],
+        steps: [{ content: [file], response: { messages: [message] } }],
+        response: {
+          messages: [message],
+          timestamp: new Date("2026-09-28T00:00:00Z"),
+        },
+        usage: { inputTokens: 1, outputTokens: 2 },
+      },
+      [],
+    );
+    expect(result).toHaveProperty(
+      "content",
+      captureAttachments
+        ? [{ type: "file", file: expect.any(Attachment) }]
+        : [],
+    );
+    expect(result).toHaveProperty(
+      "steps.0.content",
+      captureAttachments
+        ? [{ type: "file", file: expect.any(Attachment) }]
+        : [],
+    );
+    for (const path of [
+      "response.messages.0.content",
+      "steps.0.response.messages.0.content",
+    ]) {
+      expect(result).toHaveProperty(path, [
+        {
+          type: "file",
+          mediaType: "image/png",
+          ...(captureAttachments ? { data: expect.any(Attachment) } : {}),
+        },
+        { type: "text", text: "Done" },
+      ]);
+    }
+    expect(result).toHaveProperty("usage", { inputTokens: 1, outputTokens: 2 });
+    expect(result).toHaveProperty(
+      "response.timestamp",
+      "2026-09-28T00:00:00.000Z",
+    );
+    if (!captureAttachments) expect(readBytes).not.toHaveBeenCalled();
+    expect(message.content[0].data).toBe("AQID");
+  },
+);
+
+it.each([false, true])(
+  "uses the active Agents processor's owning policy (%s)",
+  async (captureAttachments) => {
+    const logger = initLogger({
+      ...loggerOptions,
+      setCurrent: false,
+      captureAttachments,
+    });
+    const processor = new OpenAIAgentsTraceProcessor({ logger });
+    const trace = {
+      type: "trace" as const,
+      traceId: "media-trace",
+      name: "media trace",
+      groupId: null,
+    };
+    const span: OpenAIAgentsSpan = {
+      type: "trace.span",
+      traceId: trace.traceId,
+      spanId: "media-span",
+      parentId: null,
+      startedAt: null,
+      endedAt: null,
+      error: null,
+      spanData: {
+        type: "response",
+        _input: [{ type: "input_image", image: "data:image/png;base64,AQID" }],
+        _response: {
+          output: [{ type: "image_generation_call", result: "AQID" }],
+        },
+      },
+    };
+    await processor.onTraceStart(trace);
+    await processor.onSpanStart(span);
+    initLogger({ ...loggerOptions, captureAttachments: !captureAttachments });
+    await processor.onSpanEnd(span);
+    const rows = await background.drain();
+    const output = rows.find(
+      (row) => "output" in row && row.output !== undefined,
+    );
+    expect(output).toHaveProperty(
+      "output",
+      captureAttachments
+        ? [{ type: "image_generation_call", result: expect.any(Attachment) }]
+        : [],
+    );
+    expect(output).toHaveProperty(
+      "input",
+      captureAttachments
+        ? [{ type: "input_image", image: expect.any(Attachment) }]
+        : [],
+    );
+    expect(
+      processor._traceSpans.get(trace.traceId)?.metadata.lastOutput,
+    ).toEqual(output && "output" in output ? output.output : undefined);
+  },
+);
+
+it.each([false, true])(
+  "keeps AI SDK streamed media on its owning policy (%s)",
+  async (captureAttachments) => {
+    const local = initLogger({
+      ...loggerOptions,
+      setCurrent: false,
+      captureAttachments,
+    });
+    const span = local.startSpan({ name: "streamed media" });
+    const part = {
+      type: "file",
+      data: new Uint8Array([1, 2, 3]),
+      mediaType: "image/png",
+    };
+    const result = {
+      fullStream: (async function* () {
+        yield part;
+      })(),
+      content: [part],
+      text: "Done",
+    };
+    expect(
+      patchAISDKStreamingResult({
+        defaultDenyOutputPaths: [],
+        endEvent: {},
+        result,
+        span,
+        startTime: Date.now() / 1000,
+      }),
+    ).toBe(true);
+    initLogger({ ...loggerOptions, captureAttachments: !captureAttachments });
+    for await (const chunk of result.fullStream) expect(chunk).toBe(part);
+    const rows = await background.drain();
+    expect(rows.find((row) => "output" in row)).toHaveProperty("output", {
+      content: [
+        {
+          type: "file",
+          mediaType: "image/png",
+          ...(captureAttachments ? { data: expect.any(Attachment) } : {}),
+        },
+      ],
+      text: "Done",
+    });
+    expect(part.data).toEqual(new Uint8Array([1, 2, 3]));
+  },
+);
+
+it.each([false, true])(
+  "applies the active Agents policy to speech and transcription (%s)",
+  async (captureAttachments) => {
+    const local = initLogger({
+      ...loggerOptions,
+      setCurrent: false,
+      captureAttachments,
+    });
+    const processor = new OpenAIAgentsTraceProcessor({ logger: local });
+    const trace = {
+      type: "trace" as const,
+      traceId: "audio-trace",
+      name: "audio trace",
+      groupId: null,
+    };
+    await processor.onTraceStart(trace);
+    for (const type of ["speech", "transcription"] as const) {
+      const audio = { data: "AQID", format: "pcm" };
+      const span: OpenAIAgentsSpan = {
+        type: "trace.span",
+        traceId: trace.traceId,
+        spanId: type,
+        parentId: null,
+        startedAt: null,
+        endedAt: null,
+        error: null,
+        spanData:
+          type === "speech"
+            ? { type, input: "Hello", output: audio }
+            : { type, input: audio, output: "Hello" },
+      };
+      await processor.onSpanStart(span);
+      initLogger({ ...loggerOptions, captureAttachments: !captureAttachments });
+      await processor.onSpanEnd(span);
+      const payload = (await background.drain()).find((row) => "output" in row);
+      expect(payload).toHaveProperty(type === "speech" ? "output" : "input", {
+        format: "pcm",
+        ...(captureAttachments ? { data: expect.any(Attachment) } : {}),
+      });
+      expect(audio.data).toBe("AQID");
+    }
+  },
+);
+
+it.each([false, true])(
+  "keeps deferred Google chat input on its owning policy (%s)",
+  async (captureAttachments) => {
+    initLogger({ ...loggerOptions, captureAttachments });
+    let release!: () => void;
+    const queued = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const pending = googleGenerativeAIChannels.sendMessage.invoke(
+      async () => {
+        await queued;
+        return { response: {} };
+      },
+      { model: "models/test", _history: [], _sendPromise: queued },
+      [[{ inlineData: { mimeType: "image/png", data: "AQID" } }]],
+      {},
+    );
+    initLogger({ ...loggerOptions, captureAttachments: !captureAttachments });
+    release();
+    await pending;
+    const inputs = (await background.drain()).filter((row) => "input" in row);
+    expect(inputs.length).toBeGreaterThan(0);
+    for (const row of inputs) {
+      if (captureAttachments)
+        expect(row).toHaveProperty(
+          "input.contents.0.parts.0.inlineData.data",
+          expect.any(Attachment),
+        );
+      else
+        expect(row).not.toHaveProperty(
+          "input.contents.0.parts.0.inlineData.data",
+        );
+    }
+  },
+);
 
 it.each([
   [false, false],

@@ -164,7 +164,7 @@ export function processInputAttachments(
       return node;
     }
 
-    if (node instanceof BaseAttachment) return node;
+    if (node instanceof BaseAttachment || node instanceof Date) return node;
     if (node instanceof URL) {
       if (node.protocol !== "data:") return node;
       if (!captureAttachments) return undefined;
@@ -179,6 +179,74 @@ export function processInputAttachments(
           `file.${getExtensionFromMediaType(mediaType)}`,
         ) ?? node
       );
+    }
+
+    // Responses API and Agents SDK image/file content parts.
+    if (node.type === "input_image" || node.type === "input_file") {
+      const field =
+        node.type === "input_file"
+          ? "file_data"
+          : "image_url" in node
+            ? "image_url"
+            : "image";
+      const data = node[field];
+      if (data instanceof BaseAttachment) return node;
+      if (typeof data === "string" || data instanceof URL) {
+        if (
+          (data instanceof URL && data.protocol !== "data:") ||
+          /^https?:/i.test(String(data))
+        )
+          return node;
+        if (!captureAttachments) return omitMediaData(node, field);
+        const mediaType = inferMediaTypeFromDataUrl(
+          String(data),
+          node.type === "input_image"
+            ? "image/png"
+            : "application/octet-stream",
+        );
+        const filename =
+          node.filename || `file.${getExtensionFromMediaType(mediaType)}`;
+        const attachment = toAttachment(data, mediaType, filename);
+        if (attachment) return { ...node, [field]: attachment };
+      }
+    }
+
+    if (node.type === "input_audio" && node.input_audio) {
+      const audio = node.input_audio;
+      if (audio.data instanceof BaseAttachment) return node;
+      if (!captureAttachments)
+        return omitMediaData({
+          ...node,
+          input_audio: omitMediaData(audio, "data"),
+        });
+      const mediaType =
+        audio.format === "mp3"
+          ? "audio/mpeg"
+          : `audio/${audio.format || "wav"}`;
+      const attachment = toAttachment(
+        audio.data,
+        mediaType,
+        `audio.${audio.format || "wav"}`,
+      );
+      if (attachment)
+        return { ...node, input_audio: { ...audio, data: attachment } };
+    }
+
+    // AI SDK generateText/streamText file parts wrap a GeneratedFile instance.
+    if (
+      node.type === "file" &&
+      node.file &&
+      typeof node.file === "object" &&
+      ("base64" in node.file || "uint8Array" in node.file)
+    ) {
+      if (!captureAttachments) return omitMediaData(node, "file");
+      const mediaType = node.file.mediaType || "application/octet-stream";
+      const attachment = toAttachment(
+        node.file.base64 ?? node.file.uint8Array,
+        mediaType,
+        `file.${getExtensionFromMediaType(mediaType)}`,
+      );
+      if (attachment) return { ...node, file: attachment };
     }
 
     // OpenAI chat image_url content format
@@ -317,8 +385,11 @@ export function processInputAttachments(
       }
     }
 
-    // AI SDK file content format
-    if (node.type === "file" && node.data) {
+    // AI SDK file parts and inline media in tool-result content.
+    if (
+      ["file", "image-data", "file-data", "media"].includes(node.type) &&
+      node.data
+    ) {
       if (node.data instanceof BaseAttachment) {
         if (captureAttachments) attachmentIndex++;
         return node;

@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { SpanTypeAttribute } from "braintrust/util";
+import { base64ToUint8Array, SpanTypeAttribute } from "braintrust/util";
 import {
   Span as BraintrustSpan,
   startSpan,
@@ -105,6 +105,31 @@ function getTimeElapsed(end?: string, start?: string): number | undefined {
   const endTime = new Date(end).getTime();
   if (isNaN(startTime) || isNaN(endTime)) return undefined;
   return (endTime - startTime) / 1000;
+}
+
+function processAudioAttachment(audio: { data: string; format: string }) {
+  if (
+    !_internalGetGlobalState()._internalCaptureAttachmentsEnabled(
+      getSpanParentObject(),
+    )
+  ) {
+    return { format: audio.format };
+  }
+
+  const format = audio.format || "wav";
+  const contentType = format === "mp3" ? "audio/mpeg" : `audio/${format}`;
+  try {
+    return {
+      ...audio,
+      data: new Attachment({
+        data: new Uint8Array(base64ToUint8Array(audio.data)).buffer,
+        filename: `audio.${format}`,
+        contentType,
+      }),
+    };
+  } catch {
+    return audio;
+  }
 }
 
 /**
@@ -568,7 +593,7 @@ export class OpenAIAgentsTraceProcessor {
       return {};
     }
     return {
-      input: spanData.input,
+      input: processAudioAttachment(spanData.input),
       output: spanData.output,
       metadata: {
         model: spanData.model,
@@ -584,7 +609,7 @@ export class OpenAIAgentsTraceProcessor {
     }
     return {
       input: spanData.input,
-      output: spanData.output,
+      output: processAudioAttachment(spanData.output),
       metadata: {
         model: spanData.model,
         model_config: spanData.model_config,

@@ -156,7 +156,9 @@ function interceptCall<
         void (self as GenerativeAIChat)._sendPromise.then(
           () => {
             try {
-              span.log(extractInput(self, args[0], operation));
+              span.log(
+                withCurrent(span, () => extractInput(self, args[0], operation)),
+              );
             } catch (error) {
               debugLogger.error("Error capturing Google chat history:", error);
             }
