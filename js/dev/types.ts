@@ -5,8 +5,7 @@ import {
   PromptData as promptDataSchema,
 } from "../src/generated_types";
 import { z } from "zod/v3";
-import { EvaluatorDef } from "../src/framework";
-import { BaseMetadata } from "../src/logger";
+import { EvaluatorFile } from "../src/framework";
 
 export const evalBodySchema = z.object({
   name: z.string(),
@@ -28,7 +27,7 @@ export const evalBodySchema = z.object({
 
 export type EvaluatorManifest = Record<
   string,
-  EvaluatorDef<unknown, unknown, unknown, BaseMetadata>
+  EvaluatorFile["evaluators"][string]["evaluator"]
 >;
 
 export const staticParametersSchema = z.record(

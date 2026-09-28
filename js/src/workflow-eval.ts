@@ -26,6 +26,7 @@ import {
   type EvalScorer,
   type EvalScorerArgs,
   type EvalTask,
+  type EvalHooks,
   type OneOrMoreScores,
   runEvaluator,
 } from "./framework";
@@ -447,8 +448,17 @@ type WorkflowEvaluator<
   Parameters extends EvalParameters = EvalParameters,
 > = Omit<
   Evaluator<Input, Output, Expected, Metadata, Parameters>,
-  "task" | "scores" | "timeout" | "signal" | "maxConcurrency" | "update"
+  | "task"
+  | "scores"
+  | "classifiers"
+  | "timeout"
+  | "signal"
+  | "maxConcurrency"
+  | "update"
+  | "environment"
+  | "snapshots"
 > & {
+  classifiers?: EvalClassifier<Input, Output, Expected, Metadata>[];
   store: WorkflowEvalStore;
   /** Maximum concurrent provider callbacks per invocation. Defaults to 10. */
   maxConcurrency?: number;
@@ -460,7 +470,13 @@ type WorkflowEvaluator<
     datum: EvalCase<Input, Expected, Metadata>,
   ) => string | Promise<string>;
   task:
-    | EvalTask<Input, Output, Expected, Metadata, Parameters>
+    | ((
+        input: Input,
+        hooks: Omit<
+          EvalHooks<Expected, Metadata, Parameters>,
+          "environment" | "snapshot" | "onCleanup" | "signal"
+        >,
+      ) => Output | Promise<Output>)
     | WorkflowTaskDefinition<
         Input,
         Output,
@@ -734,6 +750,9 @@ export function defineWorkflowEval<
   projectName: string,
   evaluator: WorkflowEvaluator<Input, Output, Expected, Metadata, Parameters>,
 ): WorkflowEvalDefinition<Parameters> {
+  if ("environment" in evaluator || "snapshots" in evaluator) {
+    throw new Error("WorkflowEval does not support environments or snapshots");
+  }
   if (
     evaluator.maxConcurrency !== undefined &&
     (!Number.isInteger(evaluator.maxConcurrency) ||

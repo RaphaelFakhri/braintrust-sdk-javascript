@@ -885,5 +885,16 @@
         "label": "v0.24 latest"
       }
     ]
+  },
+  {
+    "scenarioDirName": "eval-environments",
+    "label": "Eval environments and snapshots",
+    "metadataScenario": "eval-environments",
+    "variants": [
+      {
+        "variantKey": "default",
+        "label": "Shared service and task state"
+      }
+    ]
   }
 ]

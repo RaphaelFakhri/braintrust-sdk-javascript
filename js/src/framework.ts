@@ -24,6 +24,13 @@ import { GenericFunction } from "./framework-types";
 import { CodeFunction, CodePrompt, CodeParameters } from "./framework2";
 import { Trace, LocalTrace } from "./trace";
 import {
+  EvalScope,
+  type CleanupContext,
+  type CaptureSnapshot,
+  type SnapshotSchemas,
+  type Snapshots,
+} from "./eval-environment";
+import {
   BaseMetadata,
   BraintrustState,
   Dataset,
@@ -113,14 +120,16 @@ export type EvalTask<
   Expected,
   Metadata extends BaseMetadata,
   Parameters extends EvalParameters,
+  Environment = unknown,
+  Schemas extends SnapshotSchemas = Record<never, never>,
 > =
   | ((
       input: Input,
-      hooks: EvalHooks<Expected, Metadata, Parameters>,
+      hooks: EvalHooks<Expected, Metadata, Parameters, Environment, Schemas>,
     ) => Promise<Output>)
   | ((
       input: Input,
-      hooks: EvalHooks<Expected, Metadata, Parameters>,
+      hooks: EvalHooks<Expected, Metadata, Parameters, Environment, Schemas>,
     ) => Output);
 
 export type TaskProgressEvent = Omit<
@@ -132,7 +141,13 @@ export interface EvalHooks<
   Expected,
   Metadata extends BaseMetadata,
   Parameters extends EvalParameters,
-> {
+  Environment = unknown,
+  Schemas extends SnapshotSchemas = Record<never, never>,
+> extends CleanupContext {
+  /** The live value returned by the run's environment factory. Never automatically logged. */
+  environment: Environment;
+  /** Validate and copy a named snapshot for this trial's scorers. Each name can be captured once. */
+  snapshot: CaptureSnapshot<Schemas>;
   /**
    * @deprecated Use `metadata` instead.
    */
@@ -169,15 +184,23 @@ export interface EvalHooks<
 }
 
 // This happens to be compatible with ScorerArgs defined in "../util".
+// Keep standalone scorer calls compatible when no snapshot schemas are specified.
 export type EvalScorerArgs<
   Input,
   Output,
   Expected,
   Metadata extends BaseMetadata = DefaultMetadataType,
+  Environment = undefined,
+  Schemas extends SnapshotSchemas = never,
 > = EvalCase<Input, Expected, Metadata> & {
   output: Output;
   trace?: Trace;
-};
+} & ([Schemas] extends [never]
+    ? object
+    : {
+        environment: Environment;
+        snapshots: Snapshots<Schemas>;
+      });
 
 export type OneOrMoreScores = SingleScore | number | null | Array<Score>;
 
@@ -186,8 +209,10 @@ export type EvalScorer<
   Output,
   Expected,
   Metadata extends BaseMetadata = DefaultMetadataType,
+  Environment = undefined,
+  Schemas extends SnapshotSchemas = never,
 > = (
-  args: EvalScorerArgs<Input, Output, Expected, Metadata>,
+  args: EvalScorerArgs<Input, Output, Expected, Metadata, Environment, Schemas>,
 ) => OneOrMoreScores | Promise<OneOrMoreScores>;
 
 type OneOrMoreClassifications = Classification | Classification[] | null;
@@ -197,8 +222,10 @@ export type EvalClassifier<
   Output,
   Expected,
   Metadata extends BaseMetadata = DefaultMetadataType,
+  Environment = undefined,
+  Schemas extends SnapshotSchemas = never,
 > = (
-  args: EvalScorerArgs<Input, Output, Expected, Metadata>,
+  args: EvalScorerArgs<Input, Output, Expected, Metadata, Environment, Schemas>,
 ) => OneOrMoreClassifications | Promise<OneOrMoreClassifications>;
 
 export type EvalResult<
@@ -230,6 +257,8 @@ export interface Evaluator<
   Expected,
   Metadata extends BaseMetadata = DefaultMetadataType,
   Parameters extends EvalParameters = EvalParameters,
+  Environment = undefined,
+  Schemas extends SnapshotSchemas = Record<never, never>,
 > {
   /**
    * A function that returns a list of inputs, expected outputs, and metadata.
@@ -239,20 +268,48 @@ export interface Evaluator<
   /**
    * A function that takes an input and returns an output.
    */
-  task: EvalTask<Input, Output, Expected, Metadata, Parameters>;
+  task: EvalTask<
+    Input,
+    Output,
+    Expected,
+    Metadata,
+    Parameters,
+    NoInfer<Environment>,
+    NoInfer<Schemas>
+  >;
+
+  /** Called once per run, including empty runs. Register shared resource cleanup here. */
+  environment?: (context: CleanupContext) => Environment | Promise<Environment>;
+
+  /** Named schemas for explicit, trial-local snapshots. Captures are not automatically logged. */
+  snapshots?: Schemas;
 
   /**
    * A set of functions that take an input, output, and expected value and return a {@link Score}.
    * At least one of `scores` or `classifiers` must be provided.
    */
-  scores?: EvalScorer<Input, Output, Expected, Metadata>[];
+  scores?: EvalScorer<
+    Input,
+    Output,
+    Expected,
+    Metadata,
+    NoInfer<Environment>,
+    NoInfer<Schemas>
+  >[];
 
   /**
    * A set of functions that take an input, output, and expected value and return a
    * {@link Classification}. Results are recorded under the `classifications` column.
    * At least one of `scores` or `classifiers` must be provided.
    */
-  classifiers?: EvalClassifier<Input, Output, Expected, Metadata>[];
+  classifiers?: EvalClassifier<
+    Input,
+    Output,
+    Expected,
+    Metadata,
+    NoInfer<Environment>,
+    NoInfer<Schemas>
+  >[];
 
   /**
    * A set of parameters that will be passed to the evaluator.
@@ -308,6 +365,7 @@ export interface Evaluator<
   /**
    * The duration, in milliseconds, after which to time out the evaluation.
    * Defaults to undefined, in which case there is no timeout.
+   * Cancellation is cooperative: active tasks and cleanup finish before Eval rejects.
    */
   timeout?: number;
 
@@ -432,10 +490,20 @@ export type EvaluatorDef<
   Expected,
   Metadata extends BaseMetadata = DefaultMetadataType,
   Parameters extends EvalParameters = EvalParameters,
+  Environment = undefined,
+  Schemas extends SnapshotSchemas = Record<never, never>,
 > = {
   projectName: string;
   evalName: string;
-} & Evaluator<Input, Output, Expected, Metadata, Parameters>;
+} & Evaluator<
+  Input,
+  Output,
+  Expected,
+  Metadata,
+  Parameters,
+  Environment,
+  Schemas
+>;
 
 export type EvaluatorFile = {
   functions: CodeFunction<
@@ -452,7 +520,9 @@ export type EvaluatorFile = {
         unknown,
         unknown,
         BaseMetadata,
-        EvalParameters
+        EvalParameters,
+        any,
+        any
       >;
       reporter?: ReporterDef<unknown> | string;
     };
@@ -501,7 +571,7 @@ async function getExperimentParametersRef(
 
 export async function _internalInitEvaluatorExperiment(
   projectName: string,
-  evaluator: Evaluator<any, any, any, any, any>,
+  evaluator: Evaluator<any, any, any, any, any, any, any>,
   data: EvalData<any, any, any>,
   options: {
     disabled?: boolean;
@@ -581,7 +651,7 @@ function isIterable<T>(value: unknown): value is Iterable<T> {
 
 export async function _internalResolveEvaluatorData(
   evaluator: Pick<
-    EvaluatorDef<any, any, any, any, any>,
+    EvaluatorDef<any, any, any, any, any, any, any>,
     "data" | "projectName" | "projectId" | "state"
   >,
   experiment: Experiment | null,
@@ -746,9 +816,19 @@ export async function Eval<
   Metadata extends BaseMetadata = DefaultMetadataType,
   EvalReport = boolean,
   Parameters extends EvalParameters = EvalParameters,
+  Environment = undefined,
+  Schemas extends SnapshotSchemas = Record<never, never>,
 >(
   name: string,
-  evaluator: Evaluator<Input, Output, Expected, Metadata, Parameters>,
+  evaluator: Evaluator<
+    Input,
+    Output,
+    Expected,
+    Metadata,
+    Parameters,
+    Environment,
+    Schemas
+  >,
   reporterOrOpts?:
     | ReporterDef<EvalReport>
     | string
@@ -778,7 +858,9 @@ export async function Eval<
         unknown,
         unknown,
         BaseMetadata,
-        EvalParameters
+        EvalParameters,
+        any,
+        any
       >,
       reporter: options.reporter,
     };
@@ -961,28 +1043,28 @@ function evaluateFilter(object: unknown, filter: Filter) {
   return pattern.test(serializeJSONWithPlainString(key));
 }
 
-export function scorerName(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  scorer: EvalScorer<any, any, any, any>,
-  scorer_idx: number,
-) {
+export function scorerName(scorer: { name: string }, scorer_idx: number) {
   return scorer.name || `scorer_${scorer_idx}`;
 }
 
 export function classifierName(
-  classifier: EvalClassifier<any, any, any, any>,
+  classifier: { name: string },
   classifier_idx: number,
 ) {
   return classifier.name || `classifier_${classifier_idx}`;
 }
 
 export async function _internalRunEvaluatorTask(
-  task: EvalTask<any, any, any, any, any>,
+  task: EvalTask<any, any, any, any, any, any, any>,
   datum: EvalCase<any, any, any>,
   trialIndex: number,
   parameters: Record<string, unknown>,
   span: Span,
   reportProgress: (event: TaskProgressEvent) => void = () => undefined,
+  lifecycle?: CleanupContext & {
+    environment: unknown;
+    snapshot: (name: string, value: unknown) => void;
+  },
 ): Promise<{
   output: unknown;
   metadata: Record<string, unknown>;
@@ -991,7 +1073,25 @@ export async function _internalRunEvaluatorTask(
   const metadata: Record<string, unknown> = {
     ...("metadata" in datum ? datum.metadata : {}),
   };
-  const hooks: EvalHooks<unknown, Record<string, unknown>, EvalParameters> = {
+  const hooks: EvalHooks<
+    unknown,
+    Record<string, unknown>,
+    EvalParameters,
+    unknown,
+    SnapshotSchemas
+  > = {
+    environment: lifecycle?.environment,
+    signal: lifecycle?.signal ?? new AbortController().signal,
+    onCleanup:
+      lifecycle?.onCleanup ??
+      (() => {
+        throw new Error("onCleanup is not supported by WorkflowEval");
+      }),
+    snapshot:
+      lifecycle?.snapshot ??
+      (() => {
+        throw new Error("Snapshots are not supported by WorkflowEval");
+      }),
     meta(value) {
       Object.assign(metadata, value);
     },
@@ -1003,6 +1103,7 @@ export async function _internalRunEvaluatorTask(
     trialIndex,
     tags: [...(datum.tags ?? [])],
   };
+  lifecycle?.signal.throwIfAborted();
   const output = await task(datum.input, hooks);
   span.log({ output });
   return {
@@ -1216,7 +1317,7 @@ function logScoringFailures(
 export async function runEvaluator(
   experiment: Experiment | null,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  evaluator: EvaluatorDef<any, any, any, any, any>,
+  evaluator: EvaluatorDef<any, any, any, any, any, any, any>,
   progressReporter: ProgressReporter,
   filters: Filter[],
   stream: ((data: SSEProgressEventData) => void) | undefined,
@@ -1230,16 +1331,54 @@ export async function runEvaluator(
       "Evaluator must include at least one of `scores` or `classifiers`",
     );
   }
-  return await runEvaluatorInternal(
-    experiment,
-    evaluator,
-    progressReporter,
-    filters,
-    stream,
-    parameters,
-    collectResults,
-    enableCache,
-  );
+  const controller = new AbortController();
+  const scope = new EvalScope();
+  const abort = () =>
+    controller.abort(new InternalAbortError("Evaluator aborted"));
+  evaluator.signal?.addEventListener("abort", abort, { once: true });
+  if (evaluator.signal?.aborted) abort();
+  const timeoutId =
+    evaluator.timeout === undefined
+      ? undefined
+      : setTimeout(
+          () => controller.abort(new InternalAbortError("Evaluator timed out")),
+          evaluator.timeout,
+        );
+  const errors: unknown[] = [];
+  let result: EvalResultWithSummary<any, any, any, any> | undefined;
+  try {
+    controller.signal.throwIfAborted();
+    const environment = await evaluator.environment?.({
+      onCleanup: scope.onCleanup,
+      signal: controller.signal,
+    });
+    controller.signal.throwIfAborted();
+    result = await runEvaluatorInternal(
+      experiment,
+      evaluator,
+      progressReporter,
+      filters,
+      stream,
+      parameters,
+      collectResults,
+      enableCache,
+      environment,
+      controller,
+    );
+  } catch (error) {
+    errors.push(error);
+  } finally {
+    errors.push(...(await scope.close()));
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+    evaluator.signal?.removeEventListener("abort", abort);
+  }
+  if (controller.signal.aborted && !errors.includes(controller.signal.reason)) {
+    errors.unshift(controller.signal.reason);
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1)
+    throw new AggregateError(errors, "Eval run and cleanup failed");
+  return result!;
 }
 
 export const defaultErrorScoreHandler: ErrorScoreHandler = ({
@@ -1255,13 +1394,15 @@ export const defaultErrorScoreHandler: ErrorScoreHandler = ({
 async function runEvaluatorInternal(
   experiment: Experiment | null,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  evaluator: EvaluatorDef<any, any, any, any>,
+  evaluator: EvaluatorDef<any, any, any, any, any, any, any>,
   progressReporter: ProgressReporter,
   filters: Filter[],
   stream: ((data: SSEProgressEventData) => void) | undefined,
   parameters: InferParameters<EvalParameters> | undefined,
   collectResults: boolean,
   enableCache: boolean,
+  environment: unknown,
+  controller: AbortController,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Promise<EvalResultWithSummary<any, any, any, any>> {
   // Start span cache for this eval (it's disabled by default to avoid temp files outside of evals)
@@ -1278,6 +1419,8 @@ async function runEvaluatorInternal(
       evaluator,
       experiment,
     );
+
+    controller.signal.throwIfAborted();
 
     progressReporter.start(evaluator.evalName, 0);
 
@@ -1307,7 +1450,7 @@ async function runEvaluatorInternal(
         datum: EvalCase<any, any, any>;
         trialIndex: number;
       }) => {
-        if (cancelled) {
+        if (cancelled || controller.signal.aborted) {
           return;
         }
         const eventDataset: Dataset | undefined = experiment
@@ -1411,6 +1554,8 @@ async function runEvaluatorInternal(
             classifierName,
           );
           let unhandledScores: string[] | null = scorerNames;
+          const scope = new EvalScope(evaluator.snapshots);
+          let taskFailed = false;
           try {
             const taskResult = await rootSpan.traced(
               (span: Span) =>
@@ -1429,6 +1574,12 @@ async function runEvaluatorInternal(
                       object_type: "task",
                     });
                   },
+                  {
+                    environment,
+                    signal: controller.signal,
+                    onCleanup: scope.onCleanup,
+                    snapshot: scope.snapshot,
+                  },
                 ),
               {
                 name: "task",
@@ -1445,6 +1596,7 @@ async function runEvaluatorInternal(
               rootSpan.log({ output, metadata, expected });
             }
 
+            controller.signal.throwIfAborted();
             if (evaluator.flushBeforeScoring) {
               await rootSpan.flush();
             }
@@ -1463,6 +1615,7 @@ async function runEvaluatorInternal(
               await rootSpan.export(),
             );
 
+            controller.signal.throwIfAborted();
             const [scoreResults, classificationResults] = await Promise.all([
               Promise.all(
                 (evaluator.scores ?? []).map((score, score_idx) =>
@@ -1474,7 +1627,11 @@ async function runEvaluatorInternal(
                     scoringArgsForLogging,
                     async (span) => {
                       const scoreValue = await Promise.resolve(
-                        score(scoringArgs),
+                        score({
+                          ...scoringArgs,
+                          environment,
+                          snapshots: scope.copySnapshots(),
+                        }),
                       );
                       const prepared = _internalPrepareEvaluatorScore(
                         scoreValue,
@@ -1501,7 +1658,11 @@ async function runEvaluatorInternal(
                     scoringArgsForLogging,
                     async (span) => {
                       const classifierValue = await Promise.resolve(
-                        classifier(scoringArgs),
+                        classifier({
+                          ...scoringArgs,
+                          environment,
+                          snapshots: scope.copySnapshots(),
+                        }),
                       );
                       const prepared = _internalPrepareEvaluatorClassification(
                         classifierValue,
@@ -1563,7 +1724,16 @@ async function runEvaluatorInternal(
           } catch (e) {
             logSpanError(rootSpan, e);
             error = e;
+            taskFailed = true;
           } finally {
+            const cleanupErrors = await scope.close();
+            if (cleanupErrors.length) {
+              error = new AggregateError(
+                taskFailed ? [error, ...cleanupErrors] : cleanupErrors,
+                "Eval task cleanup failed",
+              );
+              logSpanError(rootSpan, error);
+            }
             progressReporter.increment(evaluator.evalName);
           }
 
@@ -1654,50 +1824,15 @@ async function runEvaluatorInternal(
       }
     })();
 
-    let timeoutId: ReturnType<typeof setTimeout> | undefined;
-    let abortHandler: (() => void) | undefined;
-
-    const cleanupCancellation = () => {
-      if (timeoutId !== undefined) {
-        clearTimeout(timeoutId);
-        timeoutId = undefined;
-      }
-      if (abortHandler && evaluator.signal) {
-        evaluator.signal.removeEventListener("abort", abortHandler);
-        abortHandler = undefined;
-      }
-    };
-
-    const cancel = async () => {
-      await new Promise<never>((_, reject) => {
-        // If already cancelled, reject immediately
-        if (cancelled) {
-          reject(new InternalAbortError("Evaluator already cancelled"));
-          return;
-        }
-
-        const rejectOnce = (error: InternalAbortError) => {
-          if (cancelled) {
-            return;
-          }
-          cancelled = true;
-          cleanupCancellation();
-          reject(error);
-        };
-
-        if (evaluator.timeout) {
-          timeoutId = setTimeout(() => {
-            rejectOnce(new InternalAbortError("Evaluator timed out"));
-          }, evaluator.timeout);
-        }
-        if (evaluator.signal) {
-          abortHandler = () => {
-            rejectOnce(new InternalAbortError("Evaluator aborted"));
-          };
-          evaluator.signal.addEventListener("abort", abortHandler);
-        }
-      });
-    };
+    let abortHandler: () => void;
+    const cancellation = new Promise<never>((_, reject) => {
+      abortHandler = () => {
+        cancelled = true;
+        reject(controller.signal.reason);
+      };
+      controller.signal.addEventListener("abort", abortHandler, { once: true });
+      if (controller.signal.aborted) abortHandler();
+    });
 
     const waitForQueue = (async () => {
       await enqueuePromise;
@@ -1710,7 +1845,7 @@ async function runEvaluatorInternal(
     // wait for tasks to be completed or the evaluator to be cancelled
     // if the evaluator is cancelled, the remaining tasks that have not been started will be killed
     try {
-      await Promise.race([waitForQueue, cancel()]);
+      await Promise.race([waitForQueue, cancellation]);
       if (queueErrors.length > 0) {
         throw new AggregateError(
           queueErrors,
@@ -1718,7 +1853,12 @@ async function runEvaluatorInternal(
         );
       }
     } catch (e) {
-      // Always kill the queue to prevent hanging tasks and memory leaks
+      cancelled = true;
+      controller.abort(e);
+      // Drop pending work, but preserve drain listeners until active trials and
+      // their cleanup have finished. Shared resources must outlive every trial.
+      q.remove(() => true);
+      if (!q.idle()) await q.drain();
       q.kill();
 
       if (e instanceof InternalAbortError) {
@@ -1732,7 +1872,7 @@ async function runEvaluatorInternal(
 
       throw e;
     } finally {
-      cleanupCancellation();
+      controller.signal.removeEventListener("abort", abortHandler!);
 
       // Ensure results are cleared if not collecting to free memory
       if (!collectResults) {
@@ -1823,7 +1963,7 @@ function ensureScoreAccumulator(
 
 export function buildLocalSummary(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  evaluator: EvaluatorDef<any, any, any, any>,
+  evaluator: EvaluatorDef<any, any, any, any, any, any, any>,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   results: EvalResult<any, any, any, any>[],
   precomputedScores?: ScoreAccumulator,
@@ -1905,7 +2045,7 @@ const defaultReporter: ReporterDef<boolean> = {
   name: "Braintrust default reporter",
   async reportEval(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    evaluator: EvaluatorDef<any, any, any, any>,
+    evaluator: EvaluatorDef<any, any, any, any, any, any, any>,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     result: EvalResultWithSummary<any, any, any, any>,
     { verbose, jsonl }: ReporterOpts,

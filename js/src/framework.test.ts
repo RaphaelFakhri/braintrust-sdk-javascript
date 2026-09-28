@@ -636,13 +636,13 @@ describe("runEvaluator", () => {
       ).rejects.toThrow(new InternalAbortError("Evaluator timed out"));
 
       await vi.advanceTimersByTimeAsync(10);
-      await runExpect;
 
       // first 3 tasks complete and 4th task was started but not completed before timeout
       expect(taskStarts).toEqual(new Set([0, 1, 2, 3]));
       expect(taskCompletions).toEqual(new Set([0, 1, 2]));
 
       await vi.advanceTimersByTimeAsync(200);
+      await runExpect;
 
       // no other tasks are started after evaluator is aborted and the 4th in-flight task completes
       expect(taskStarts).toEqual(new Set([0, 1, 2, 3]));
@@ -686,13 +686,13 @@ describe("runEvaluator", () => {
 
       await vi.advanceTimersByTimeAsync(10);
       abortController.abort();
-      await runExpect;
 
       // first 3 tasks complete and 4th task was started but not completed before abort
       expect(taskStarts).toEqual(new Set([0, 1, 2, 3]));
       expect(taskCompletions).toEqual(new Set([0, 1, 2]));
 
       await vi.advanceTimersByTimeAsync(200);
+      await runExpect;
 
       // no other tasks are started after evaluator is aborted and the 4th in-flight task completes
       expect(taskStarts).toEqual(new Set([0, 1, 2, 3]));

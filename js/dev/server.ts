@@ -5,7 +5,6 @@ import {
   callEvaluatorData,
   Eval,
   EvalData,
-  EvalHooks,
   EvalScorer,
   EvaluatorDef,
   OneOrMoreScores,
@@ -44,7 +43,7 @@ import {
   EvaluatorManifest,
   type SerializedParametersContainer,
 } from "./types";
-import { EvalParameters, validateParameters } from "../src/eval-parameters";
+import { validateParameters } from "../src/eval-parameters";
 import { z } from "zod/v3";
 import { ValidationError } from "ajv";
 import { serializeRemoteEvalParametersContainer } from "../src/framework2";
@@ -57,7 +56,7 @@ export interface DevServerOpts {
 
 export function runDevServer(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  evaluators: EvaluatorDef<any, any, any, any, any>[],
+  evaluators: EvaluatorDef<any, any, any, any, any, any, any>[],
   opts: DevServerOpts,
 ) {
   // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
@@ -195,7 +194,7 @@ export function runDevServer(
 
       const task = async (
         input: unknown,
-        hooks: EvalHooks<unknown, BaseMetadata, EvalParameters>,
+        hooks: Parameters<typeof evaluator.task>[1],
       ) => {
         const result = await evaluator.task(input, hooks);
 
