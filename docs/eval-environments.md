@@ -70,9 +70,14 @@ The eval framework does not require an emulator adapter or know about that servi
 ## Names and types come from schemas
 
 The `snapshots` option declares names and Zod schemas; it does not capture anything automatically.
+Schemas from both Zod 3 and Zod 4 are supported, including mixed schema maps.
 `snapshot(name, value)` validates and copies the parsed value synchronously.
+Parsed values must contain only primitives (excluding symbols), arrays, and plain records with enumerable string-keyed data properties.
+Class instances, buffers (including shared memory), other built-in objects, functions, and accessor properties are rejected, including when nested.
+Convert these values to plain data in a schema transform before capturing them.
 Each name can be captured once per trial.
 Unknown names, invalid values, duplicate captures, and values that cannot be structured-cloned throw errors identifying the snapshot.
+Capture failures omit the original error and its cause because they may contain private snapshot values.
 
 ```ts
 snapshots: {

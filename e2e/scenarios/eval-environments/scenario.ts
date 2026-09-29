@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { Eval, initLogger } from "braintrust";
 import { z } from "zod/v3";
+import * as z4 from "zod/v4";
 import {
   getTestRunId,
   runMain,
@@ -66,7 +67,8 @@ async function main() {
           },
           snapshots: {
             seeded: z.object({ count: z.number() }),
-            afterRequest: z.object({ count: z.number() }),
+            afterRequest: z4.object({ count: z4.number() }),
+            parsedCount: z4.string().transform(Number),
             unused: z.string(),
           },
           task: async (
@@ -84,6 +86,7 @@ async function main() {
             const response = await fetch(`${environment.baseUrl}/${id}`);
             assert(response.ok);
             snapshot("afterRequest", state);
+            snapshot("parsedCount", String(state.count));
             return (await response.json()).count as number;
           },
           scores: [
@@ -91,6 +94,7 @@ async function main() {
               assert(environment.isOpen());
               assert.equal(snapshots.seeded?.count, input);
               assert.equal(snapshots.afterRequest?.count, input + 1);
+              assert.equal(snapshots.parsedCount, input + 1);
               assert.equal(snapshots.unused, undefined);
               assert.equal(output, input + 1);
               snapshots.seeded!.count = -1;

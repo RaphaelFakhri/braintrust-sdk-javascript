@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, expectTypeOf, test, vi } from "vitest";
 import { z } from "zod/v3";
+import * as z4 from "zod/v4";
 import {
   Eval,
   callEvaluatorData,
@@ -10,6 +11,7 @@ import {
 } from "./framework";
 import { EvalScope } from "./eval-environment";
 import { configureNode } from "./node/config";
+import { NOOP_SPAN } from "./logger";
 
 beforeAll(configureNode);
 const options = {
@@ -18,6 +20,113 @@ const options = {
 };
 
 describe("eval environments and snapshots", () => {
+  test("mixed Zod versions infer capture inputs and transformed scorer outputs", async () => {
+    const result = await Eval(
+      "mixed snapshot schemas",
+      {
+        data: [{ input: 1 }],
+        snapshots: {
+          legacy: z.string().transform(Number),
+          current: z4.string().transform(Number),
+        },
+        task: (input, { snapshot }) => {
+          snapshot("legacy", "1");
+          snapshot("current", "2");
+          if (false) {
+            // @ts-expect-error Zod 4 transforms accept the input type.
+            snapshot("current", 2);
+            // @ts-expect-error Zod 3 transforms accept the input type.
+            snapshot("legacy", 1);
+            // @ts-expect-error Unknown names must not widen the schema map.
+            snapshot("missing", "3");
+          }
+          return input;
+        },
+        scores: [
+          ({ snapshots }) => {
+            expectTypeOf(snapshots.current).toEqualTypeOf<number | undefined>();
+            expectTypeOf(snapshots.legacy).toEqualTypeOf<number | undefined>();
+            expect(snapshots).toEqual({ legacy: 1, current: 2 });
+            return 1;
+          },
+        ],
+        classifiers: [
+          ({ snapshots }) => {
+            expectTypeOf(snapshots.current).toEqualTypeOf<number | undefined>();
+            return { name: "count", id: String(snapshots.current) };
+          },
+        ],
+      },
+      options,
+    );
+    expect(result.results[0].error).toBeUndefined();
+    expect(result.results[0].scores).toEqual({ scorer_0: 1 });
+    expect(result.results[0].classifications?.count).toEqual([
+      { id: "2", label: "2" },
+    ]);
+  });
+
+  test.each([
+    ["Buffer", Buffer.from("snapshot")],
+    [
+      "class instance",
+      new (class State {
+        count = 1;
+      })(),
+    ],
+    ["shared buffer", new SharedArrayBuffer(8)],
+    ["shared view", new Uint8Array(new SharedArrayBuffer(8))],
+    [
+      "accessor",
+      {
+        get count() {
+          return 1;
+        },
+      },
+    ],
+    ["symbol key", { [Symbol("count")]: 1 }],
+    ["hidden property", Object.defineProperty({}, "count", { value: 1 })],
+  ])("rejects nested %s without consuming the snapshot name", (_, value) => {
+    const scope = new EvalScope({ state: z.unknown() });
+    expect(() => scope.snapshot("state", { nested: [value] })).toThrow(
+      'Failed to capture snapshot "state"',
+    );
+    scope.snapshot("state", { count: 1 });
+    expect(scope.copySnapshots()).toEqual({ state: { count: 1 } });
+  });
+
+  test("rejects schema outputs that cloning would change and accepts explicit plain-data transforms", () => {
+    const scope = new EvalScope({
+      raw: z.instanceof(Buffer),
+      converted: z4.instanceof(Buffer).transform((value) => Array.from(value)),
+    });
+    const buffer = Buffer.from([1, 2]);
+    expect(() => scope.snapshot("raw", buffer)).toThrow(
+      'Failed to capture snapshot "raw"',
+    );
+    scope.snapshot("converted", buffer);
+    buffer[0] = 99;
+    expect(scope.copySnapshots()).toEqual({ converted: [1, 2] });
+  });
+
+  test("plain-data snapshots preserve cycles, aliases, and primitive values while isolating copies", () => {
+    const scope = new EvalScope({ state: z.unknown() });
+    const state: Record<string, unknown> = {
+      values: [undefined, null, true, "value", 1n, NaN, Infinity],
+      child: { count: 1 },
+    };
+    state.self = state;
+    state.alias = state.child;
+    scope.snapshot("state", state);
+    const first = scope.copySnapshots().state as typeof state;
+    const second = scope.copySnapshots().state as typeof state;
+    expect(first).toEqual(state);
+    expect(first.self).toBe(first);
+    expect(first.alias).toBe(first.child);
+    expect(first.child).not.toBe(state.child);
+    expect(first.child).not.toBe(second.child);
+  });
+
   test("standalone scorers and classifiers can declare an environment without snapshots", async () => {
     type Environment = { count: number };
     const score: EvalScorer<number, number, void, {}, Environment> = ({
@@ -280,6 +389,79 @@ describe("eval environments and snapshots", () => {
     expect(Object.keys(scope.copySnapshots())).toEqual(["__proto__", "count"]);
   });
 
+  test.each([
+    ["Zod 3 literal", z.unknown().pipe(z.literal("public"))],
+    ["Zod 3 enum", z.unknown().pipe(z.enum(["public"]))],
+    ["Zod 4 enum", z4.unknown().pipe(z4.enum(["public"]))],
+    [
+      "custom validation message",
+      z.string().superRefine((value, context) => {
+        context.addIssue({ code: "custom", message: value });
+      }),
+    ],
+    [
+      "transform error",
+      z4.string().transform((value) => {
+        throw new Error(value, { cause: new Error(value) });
+      }),
+    ],
+  ])(
+    "does not log private snapshot values from %s failures",
+    async (_, schema) => {
+      const secret = "private-snapshot-value";
+      const log = vi.spyOn(NOOP_SPAN, "log");
+      try {
+        const result = await Eval(
+          "private snapshot failure",
+          {
+            data: [{ input: 1 }],
+            snapshots: { state: schema },
+            task: (_, { snapshot }) => {
+              snapshot("state", secret);
+            },
+            scores: [],
+          },
+          options,
+        );
+        expect(result.results[0].error).toMatchObject({
+          message: 'Failed to capture snapshot "state"',
+        });
+        expect(result.results[0].error).not.toHaveProperty("cause");
+        const logged = JSON.stringify(log.mock.calls);
+        expect(logged).toContain("Failed to capture snapshot");
+        expect(logged).not.toContain(secret);
+      } finally {
+        log.mockRestore();
+      }
+    },
+  );
+
+  test.each(["constructor", "toString", "__proto__"])(
+    "uncaptured snapshot %s is undefined for scorers and classifiers",
+    async (name) => {
+      const result = await Eval(
+        "uncaptured reserved snapshot",
+        {
+          data: [{ input: 1 }],
+          snapshots: { [name]: z.number() },
+          task: (input) => input,
+          scores: [({ snapshots }) => Number(snapshots[name] === undefined)],
+          classifiers: [
+            ({ snapshots }) => ({
+              name: "missing",
+              id: String(snapshots[name] === undefined),
+            }),
+          ],
+        },
+        options,
+      );
+      expect(result.results[0].scores).toEqual({ scorer_0: 1 });
+      expect(result.results[0].classifications?.missing).toEqual([
+        { id: "true", label: "true" },
+      ]);
+    },
+  );
+
   test("preserves task errors, skips scorers, and attempts every cleanup", async () => {
     const taskError = new Error("task failed");
     const cleanupError = new Error("cleanup failed");
@@ -487,6 +669,64 @@ describe("eval environments and snapshots", () => {
     },
   );
 
+  test.each([false, true])(
+    "data failure aborts pending setup and awaits cleanup (setup fails: %s)",
+    async (setupFails) => {
+      const dataError = new Error("data failed during setup");
+      const setupError = new Error("setup failed after cancellation");
+      const events: string[] = [];
+      let started!: () => void;
+      const setupStarted = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const task = vi.fn();
+      const failure = await Eval(
+        "data failure cancels setup",
+        {
+          // Bound the regression case where data failure never aborts setup.
+          timeout: 1000,
+          data: async () => {
+            await setupStarted;
+            throw dataError;
+          },
+          environment: async ({ signal, onCleanup }) => {
+            onCleanup(async () => {
+              await Promise.resolve();
+              events.push("shared cleanup");
+            });
+            await new Promise<void>((resolve) => {
+              signal.addEventListener("abort", () => resolve(), { once: true });
+              started();
+            });
+            expect(signal.reason).toBe(dataError);
+            events.push("setup aborted");
+            await Promise.resolve();
+            events.push("setup finished");
+            if (setupFails) throw setupError;
+          },
+          task,
+          scores: [],
+        },
+        options,
+      ).catch((error: unknown) => error);
+      if (setupFails) {
+        expect(failure).toBeInstanceOf(AggregateError);
+        expect((failure as AggregateError).errors).toEqual([
+          dataError,
+          setupError,
+        ]);
+      } else {
+        expect(failure).toBe(dataError);
+      }
+      expect(task).not.toHaveBeenCalled();
+      expect(events).toEqual([
+        "setup aborted",
+        "setup finished",
+        "shared cleanup",
+      ]);
+    },
+  );
+
   test("cancellation during setup waits for pending data and preserves its failure", async () => {
     const controller = new AbortController();
     const dataError = new Error("data failed after cancellation");
@@ -634,6 +874,102 @@ describe("eval environments and snapshots", () => {
         "task cleanup",
         ...(withEnvironment ? ["shared cleanup"] : []),
       ]);
+    },
+  );
+
+  test.each([
+    { cancellation: "abort", returnResults: true },
+    { cancellation: "abort", returnResults: false },
+    { cancellation: "timeout", returnResults: true },
+    { cancellation: "timeout", returnResults: false },
+  ])(
+    "$cancellation preserves task cleanup errors (returnResults: $returnResults)",
+    async ({ cancellation, returnResults }) => {
+      const controller = new AbortController();
+      const firstError = new Error("first cleanup failed");
+      const secondError = new Error("second cleanup failed");
+      const sharedCleanup = vi.fn();
+      const failure = await Eval(
+        "cancel failing cleanup",
+        {
+          data: [{ input: 1 }],
+          signal: controller.signal,
+          timeout: cancellation === "timeout" ? 10 : undefined,
+          environment: ({ onCleanup }) => {
+            onCleanup(sharedCleanup);
+          },
+          task: async (_, { signal, onCleanup }) => {
+            onCleanup(() => {
+              throw firstError;
+            });
+            onCleanup(async () => {
+              await Promise.resolve();
+              throw secondError;
+            });
+            const aborted = new Promise<void>((resolve) =>
+              signal.addEventListener("abort", () => resolve(), { once: true }),
+            );
+            if (cancellation === "abort") controller.abort();
+            await aborted;
+          },
+          scores: [],
+        },
+        { ...options, returnResults },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect((failure as AggregateError).errors).toEqual([
+        expect.objectContaining({
+          message:
+            cancellation === "timeout"
+              ? "Evaluator timed out"
+              : "Evaluator aborted",
+        }),
+        secondError,
+        firstError,
+      ]);
+      expect(sharedCleanup).toHaveBeenCalledOnce();
+    },
+  );
+
+  test.each([true, false])(
+    "bounds retained cleanup failures across trials (returnResults: %s)",
+    async (returnResults) => {
+      const controller = new AbortController();
+      const cleanupErrors = Array.from(
+        { length: 12 },
+        (_, index) => new Error(`cleanup ${index} failed`),
+      );
+      const attempted: Error[] = [];
+      const failure = await Eval(
+        "bounded cleanup failures",
+        {
+          data: [0, 1, 2, 3].map((input) => ({ input })),
+          maxConcurrency: 1,
+          signal: controller.signal,
+          task: (input, { onCleanup }) => {
+            if (input === 3) onCleanup(() => controller.abort());
+            for (let index = 2; index >= 0; index--) {
+              const error = cleanupErrors[input * 3 + index];
+              onCleanup(() => {
+                attempted.push(error);
+                throw error;
+              });
+            }
+            return input;
+          },
+          scores: [],
+        },
+        { ...options, returnResults },
+      ).catch((error: unknown) => error);
+      expect(attempted).toEqual(cleanupErrors);
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect((failure as AggregateError).errors).toEqual([
+        expect.objectContaining({ message: "Evaluator aborted" }),
+        ...cleanupErrors.slice(0, 5),
+      ]);
+      expect((failure as AggregateError).message).toContain(
+        "7 additional task cleanup errors omitted",
+      );
     },
   );
 

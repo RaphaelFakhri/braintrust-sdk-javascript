@@ -1354,6 +1354,7 @@ export async function runEvaluator(
     evaluator.data instanceof Promise
       ? evaluator.data.catch((error: unknown) => {
           errors.push(error);
+          controller.abort(error);
         })
       : undefined;
   let result: EvalResultWithSummary<any, any, any, any> | undefined;
@@ -1462,6 +1463,8 @@ async function runEvaluatorInternal(
       : {};
     let cancelled = false;
     let scheduledTrials = 0;
+    const taskCleanupErrors: unknown[] = [];
+    let omittedTaskCleanupErrors = 0;
     const q = queue(
       async ({
         datum,
@@ -1766,6 +1769,14 @@ async function runEvaluatorInternal(
           } finally {
             const cleanupErrors = await scope.close();
             if (cleanupErrors.length) {
+              for (const cleanupError of cleanupErrors) {
+                // Bound run-level retention even when results are discarded.
+                if (taskCleanupErrors.length < 5) {
+                  taskCleanupErrors.push(cleanupError);
+                } else {
+                  omittedTaskCleanupErrors++;
+                }
+              }
               error = new AggregateError(
                 taskFailed ? [error, ...cleanupErrors] : cleanupErrors,
                 "Eval task cleanup failed",
@@ -1911,10 +1922,18 @@ async function runEvaluatorInternal(
         }
       }
 
+      const errors = [e, ...taskCleanupErrors];
       if (dataResult.status === "rejected" && dataResult.reason !== e) {
+        errors.push(dataResult.reason);
+      }
+      if (errors.length > 1) {
         throw new AggregateError(
-          [e, dataResult.reason],
-          "Eval cancellation and data iteration failed",
+          errors,
+          `Eval run, data iteration, or task cleanup failed${
+            omittedTaskCleanupErrors
+              ? `; ${omittedTaskCleanupErrors} additional task cleanup errors omitted`
+              : ""
+          }`,
         );
       }
       throw e;
