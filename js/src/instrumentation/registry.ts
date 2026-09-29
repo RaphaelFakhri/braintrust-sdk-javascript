@@ -62,10 +62,12 @@ class PluginRegistry {
       );
       return;
     }
-    this.config = { ...this.config, ...config };
+    // Register customizers first so an unsupported configuration throws
+    // without partially applying the rest of the config.
     if ("spanCustomizers" in config) {
       setSpanCustomizers(config.spanCustomizers);
     }
+    this.config = { ...this.config, ...config };
   }
 
   /**
