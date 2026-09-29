@@ -885,5 +885,20 @@
         "label": "v0.24 latest"
       }
     ]
+  },
+  {
+    "scenarioDirName": "langchain-anthropic",
+    "label": "LangChain Anthropic",
+    "metadataScenario": "langchain-anthropic",
+    "variants": [
+      {
+        "variantKey": "langchain-anthropic-v1",
+        "label": "v1 pinned"
+      },
+      {
+        "variantKey": "langchain-anthropic-v1-latest",
+        "label": "v1 latest"
+      }
+    ]
   }
 ]
