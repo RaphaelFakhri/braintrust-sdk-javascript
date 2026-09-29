@@ -3257,6 +3257,18 @@ export interface BackgroundLoggerOpts {
 const DEFAULT_FLUSH_BACKPRESSURE_BYTES = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_MAX_CONCURRENT_LOG_REQUESTS = 8;
 
+// Read a numeric environment variable. Unset, empty, whitespace-only and
+// non-numeric values return undefined so the caller keeps its default, rather
+// than being read as 0 (`Number("") === 0`).
+function getNumericEnv(name: string): number | undefined {
+  const raw = iso.getEnv(name);
+  if (raw === undefined || raw === null || raw.trim() === "") {
+    return undefined;
+  }
+  const value = Number(raw);
+  return isNaN(value) ? undefined : value;
+}
+
 interface BackgroundLogger {
   log(items: LazyValue<BackgroundLogEvent>[]): void;
   flush(): Promise<void>;
@@ -3450,44 +3462,39 @@ class HTTPBackgroundLogger implements BackgroundLogger {
     opts = opts ?? {};
     this.apiConn = apiConn;
 
-    const syncFlushEnv = Number(iso.getEnv("BRAINTRUST_SYNC_FLUSH"));
-    if (!isNaN(syncFlushEnv)) {
+    const syncFlushEnv = getNumericEnv("BRAINTRUST_SYNC_FLUSH");
+    if (syncFlushEnv !== undefined) {
       this.syncFlush = Boolean(syncFlushEnv);
     }
 
-    const defaultBatchSizeEnv = Number(
-      iso.getEnv("BRAINTRUST_DEFAULT_BATCH_SIZE"),
-    );
-    if (!isNaN(defaultBatchSizeEnv)) {
+    const defaultBatchSizeEnv = getNumericEnv("BRAINTRUST_DEFAULT_BATCH_SIZE");
+    if (defaultBatchSizeEnv !== undefined) {
       this.defaultBatchSize = defaultBatchSizeEnv;
     }
 
-    const maxRequestSizeEnv = Number(iso.getEnv("BRAINTRUST_MAX_REQUEST_SIZE"));
-    if (!isNaN(maxRequestSizeEnv)) {
+    const maxRequestSizeEnv = getNumericEnv("BRAINTRUST_MAX_REQUEST_SIZE");
+    if (maxRequestSizeEnv !== undefined) {
       this.maxRequestSizeOverride = maxRequestSizeEnv;
     }
 
-    const numTriesEnv = Number(iso.getEnv("BRAINTRUST_NUM_RETRIES"));
-    if (!isNaN(numTriesEnv)) {
+    const numTriesEnv = getNumericEnv("BRAINTRUST_NUM_RETRIES");
+    if (numTriesEnv !== undefined) {
       this.numTries = numTriesEnv + 1;
     }
 
-    const queueDropExceedingMaxsizeEnv = Number(
-      iso.getEnv("BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE"),
+    const queueDropExceedingMaxsizeEnv = getNumericEnv(
+      "BRAINTRUST_QUEUE_DROP_EXCEEDING_MAXSIZE",
     );
 
-    if (!isNaN(queueDropExceedingMaxsizeEnv)) {
+    if (queueDropExceedingMaxsizeEnv !== undefined) {
       this.queueDropExceedingMaxsize = queueDropExceedingMaxsizeEnv;
     }
 
     this.queue = new Queue(this.queueDropExceedingMaxsize);
 
-    const maxConcurrentLogRequestsEnv = Number(
-      iso.getEnv("BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS"),
-    );
-    const maxConcurrentLogRequests = !isNaN(maxConcurrentLogRequestsEnv)
-      ? maxConcurrentLogRequestsEnv
-      : DEFAULT_MAX_CONCURRENT_LOG_REQUESTS;
+    const maxConcurrentLogRequests =
+      getNumericEnv("BRAINTRUST_MAX_CONCURRENT_LOG_REQUESTS") ??
+      DEFAULT_MAX_CONCURRENT_LOG_REQUESTS;
     if (
       !Number.isInteger(maxConcurrentLogRequests) ||
       maxConcurrentLogRequests < 1
@@ -3502,10 +3509,10 @@ class HTTPBackgroundLogger implements BackgroundLogger {
       this.requestLimiter = new ConcurrencyLimiter(maxConcurrentLogRequests);
     }
 
-    const queueDropLoggingPeriodEnv = Number(
-      iso.getEnv("BRAINTRUST_QUEUE_DROP_LOGGING_PERIOD"),
+    const queueDropLoggingPeriodEnv = getNumericEnv(
+      "BRAINTRUST_QUEUE_DROP_LOGGING_PERIOD",
     );
-    if (!isNaN(queueDropLoggingPeriodEnv)) {
+    if (queueDropLoggingPeriodEnv !== undefined) {
       this.queueDropLoggingPeriod = queueDropLoggingPeriodEnv;
     }
 
@@ -3517,10 +3524,13 @@ class HTTPBackgroundLogger implements BackgroundLogger {
       );
     }
 
-    const flushBackpressureBytesEnv = Number(
-      iso.getEnv("BRAINTRUST_FLUSH_BACKPRESSURE_BYTES"),
+    const flushBackpressureBytesEnv = getNumericEnv(
+      "BRAINTRUST_FLUSH_BACKPRESSURE_BYTES",
     );
-    if (!isNaN(flushBackpressureBytesEnv) && flushBackpressureBytesEnv > 0) {
+    if (
+      flushBackpressureBytesEnv !== undefined &&
+      flushBackpressureBytesEnv > 0
+    ) {
       this._flushBackpressureBytes = flushBackpressureBytesEnv;
     }
 
@@ -6715,8 +6725,7 @@ function wrapTracedSyncGenerator<F extends (...args: any[]) => any>(
         span.log({ input: fnArgs });
       }
 
-      const envValue = iso.getEnv("BRAINTRUST_MAX_GENERATOR_ITEMS");
-      const maxItems = envValue !== undefined ? Number(envValue) : 1000;
+      const maxItems = getNumericEnv("BRAINTRUST_MAX_GENERATOR_ITEMS") ?? 1000;
 
       if (!noTraceIO && maxItems !== 0) {
         let collected: any[] = [];
@@ -6782,8 +6791,7 @@ function wrapTracedAsyncGenerator<F extends (...args: any[]) => any>(
         span.log({ input: fnArgs });
       }
 
-      const envValue = iso.getEnv("BRAINTRUST_MAX_GENERATOR_ITEMS");
-      const maxItems = envValue !== undefined ? Number(envValue) : 1000;
+      const maxItems = getNumericEnv("BRAINTRUST_MAX_GENERATOR_ITEMS") ?? 1000;
 
       if (!noTraceIO && maxItems !== 0) {
         let collected: any[] = [];
