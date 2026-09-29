@@ -226,7 +226,7 @@ export class OpenAIPlugin extends BasePlugin {
         type: SpanTypeAttribute.LLM,
         extractInput: ([params]) => extractOpenAIResponsesInput(params),
         extractFromEvent: (event) => {
-          if (event.type !== "response.completed" || !event.response) {
+          if (!isTerminalResponseEvent(event) || !event.response) {
             return {};
           }
 
@@ -601,7 +601,23 @@ export function aggregateChatCompletionChunks(
   };
 }
 
-function aggregateResponseStreamEvents(
+// A Responses API stream ends with one of these events. Streams that hit
+// `max_output_tokens` or a content filter end with `response.incomplete`, and
+// both carry the final `response` object with output and usage.
+const TERMINAL_RESPONSE_EVENT_TYPES = new Set([
+  "response.completed",
+  "response.incomplete",
+  "response.failed",
+]);
+
+function isTerminalResponseEvent(event: { type?: unknown }): boolean {
+  return (
+    typeof event.type === "string" &&
+    TERMINAL_RESPONSE_EVENT_TYPES.has(event.type)
+  );
+}
+
+export function aggregateResponseStreamEvents(
   chunks: OpenAIResponseStreamEvent[],
   _streamResult?: unknown,
   endEvent?: unknown,
@@ -618,7 +634,7 @@ function aggregateResponseStreamEvents(
     if (!chunk || !chunk.type || !chunk.response) {
       continue;
     }
-    if (chunk.type !== "response.completed") {
+    if (!isTerminalResponseEvent(chunk)) {
       continue;
     }
 
