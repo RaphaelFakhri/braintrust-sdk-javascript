@@ -1699,7 +1699,7 @@ describe("processImagesInOutput", () => {
 describe("aggregateResponseStreamEvents", () => {
   const usage = { input_tokens: 10, output_tokens: 4, total_tokens: 14 };
 
-  it.each(["response.completed", "response.incomplete", "response.failed"])(
+  it.each(["response.completed", "response.incomplete"])(
     "reads output and usage from the terminal %s event",
     (type) => {
       const chunks = [
@@ -1724,8 +1724,22 @@ describe("aggregateResponseStreamEvents", () => {
         tokens: 14,
       });
       expect(result.metadata).toMatchObject({ id: "resp_1" });
+      expect(result.error).toBeUndefined();
     },
   );
+
+  it("logs the error from a terminal response.failed event", () => {
+    const error = { code: "server_error", message: "The model failed." };
+    const result = aggregateResponseStreamEvents([
+      {
+        type: "response.failed",
+        response: { id: "resp_1", status: "failed", output: [], error, usage },
+      },
+    ]);
+
+    expect(result.error).toBe(JSON.stringify(error));
+    expect(result.metadata).toMatchObject({ status: "failed", error });
+  });
 
   it("ignores non-terminal events that carry a response", () => {
     const result = aggregateResponseStreamEvents([

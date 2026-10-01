@@ -1033,6 +1033,35 @@ export async function runOpenAIInstrumentationScenario(options) {
       );
 
       await runOperation(
+        "openai-responses-create-stream-incomplete-operation",
+        "responses-create-stream-incomplete",
+        async () => {
+          const { data: responseStream } = await awaitMaybeWithResponse(
+            client.responses.create({
+              model: OPENAI_MODEL,
+              input: "Count from 1 to 100, separated by commas.",
+              max_output_tokens: 16,
+              stream: true,
+            }),
+          );
+          await collectAsync(responseStream);
+        },
+      );
+
+      await runOperation(
+        "openai-responses-stream-incomplete-operation",
+        "responses-stream-incomplete",
+        async () => {
+          const stream = client.responses.stream({
+            model: OPENAI_MODEL,
+            input: "Count from 100 down to 1, separated by commas.",
+            max_output_tokens: 16,
+          });
+          await collectAsync(stream);
+        },
+      );
+
+      await runOperation(
         "openai-responses-parse-operation",
         "responses-parse",
         async () => {

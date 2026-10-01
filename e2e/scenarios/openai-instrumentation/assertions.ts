@@ -93,6 +93,14 @@ function validateStreamFixtureOutput(span: CapturedLogEvent | undefined): void {
   expect(message?.refusal).toBe("NOPE");
 }
 
+function validateIncompleteResponse(span: CapturedLogEvent | undefined): void {
+  expect(span?.row.metadata).toMatchObject({
+    incomplete_details: { reason: "max_output_tokens" },
+    status: "incomplete",
+  });
+  expect(span?.metrics?.completion_tokens).toEqual(expect.any(Number));
+}
+
 function validateMultipleChoicesStreamOutput(
   span: CapturedLogEvent | undefined,
 ): void {
@@ -639,6 +647,25 @@ const OPERATION_SPECS: readonly OperationSpec[] = [
     name: "openai-responses-stream-partial-operation",
     operation: "responses-stream-partial",
     testName: "captures partial streamed responses before final output",
+  },
+  {
+    childNames: ["openai.responses.create"],
+    expectsOutput: true,
+    expectsTimeToFirstToken: true,
+    name: "openai-responses-create-stream-incomplete-operation",
+    operation: "responses-create-stream-incomplete",
+    testName:
+      "captures incomplete responses from client.responses.create({ stream: true })",
+    validate: validateIncompleteResponse,
+  },
+  {
+    childNames: ["openai.responses.create"],
+    expectsOutput: true,
+    expectsTimeToFirstToken: true,
+    name: "openai-responses-stream-incomplete-operation",
+    operation: "responses-stream-incomplete",
+    testName: "captures incomplete responses from client.responses.stream()",
+    validate: validateIncompleteResponse,
   },
   {
     childNames: ["openai.responses.parse", "openai.responses.create"],

@@ -181,13 +181,13 @@ export interface OpenAIResponse {
   [key: string]: unknown;
 }
 
-export interface OpenAIResponseCompletedEvent {
-  type: "response.completed";
+export interface OpenAIResponseTerminalEvent {
+  type: "response.completed" | "response.incomplete" | "response.failed";
   response: OpenAIResponse;
 }
 
 export type OpenAIResponseStreamEvent =
-  | OpenAIResponseCompletedEvent
+  | OpenAIResponseTerminalEvent
   | {
       type: string;
       response?: OpenAIResponse;

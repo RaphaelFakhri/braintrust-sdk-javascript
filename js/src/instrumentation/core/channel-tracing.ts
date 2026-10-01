@@ -98,6 +98,7 @@ type StreamingChannelSpanConfig<TChannel extends AnyAsyncChannel> =
       output: unknown;
       metrics: Record<string, number>;
       metadata?: Record<string, unknown>;
+      error?: string;
     };
     patchResult?: (args: {
       channelName: string;
@@ -113,6 +114,7 @@ type StreamingChannelSpanConfig<TChannel extends AnyAsyncChannel> =
       metadata?: Record<string, unknown>;
       metrics: Record<string, number>;
       output: unknown;
+      error?: string;
       result: StreamingResult<TChannel>;
       span: Span;
       startTime: number;
@@ -140,6 +142,7 @@ type SyncStreamChannelSpanConfig<TChannel extends AnySyncStreamChannel> =
       output?: unknown;
       metrics?: Record<string, number>;
       metadata?: Record<string, unknown>;
+      error?: string;
     };
     patchResult?: (args: {
       channelName: string;
@@ -386,6 +389,7 @@ function runStreamingCompletionHook<TChannel extends AnyAsyncChannel>(args: {
   metadata?: Record<string, unknown>;
   metrics: Record<string, number>;
   output: unknown;
+  error?: string;
   result: StreamingResult<TChannel>;
   span: Span;
   startTime: number;
@@ -402,6 +406,7 @@ function runStreamingCompletionHook<TChannel extends AnyAsyncChannel>(args: {
       ...(args.metadata !== undefined ? { metadata: args.metadata } : {}),
       metrics: args.metrics,
       output: args.output,
+      ...(args.error !== undefined ? { error: args.error } : {}),
       result: args.result,
       span: args.span,
       startTime: args.startTime,
@@ -603,12 +608,14 @@ export function traceStreamingChannel<TChannel extends AnyAsyncChannel>(
                   metadata?: Record<string, unknown>;
                   metrics: Record<string, number>;
                   output: unknown;
+                  error?: string;
                 }
               | undefined;
             try {
               let output: unknown;
               let metrics: Record<string, number>;
               let metadata: Record<string, unknown> | undefined;
+              let error: string | undefined;
 
               if (config.aggregateChunks) {
                 const aggregated = config.aggregateChunks(
@@ -620,6 +627,7 @@ export function traceStreamingChannel<TChannel extends AnyAsyncChannel>(
                 output = aggregated.output;
                 metrics = aggregated.metrics;
                 metadata = aggregated.metadata;
+                error = aggregated.error;
               } else {
                 output = config.extractOutput(
                   chunks as unknown as StreamingResult<TChannel>,
@@ -649,11 +657,13 @@ export function traceStreamingChannel<TChannel extends AnyAsyncChannel>(
                 ...(metadata !== undefined ? { metadata } : {}),
                 metrics,
                 output,
+                ...(error !== undefined ? { error } : {}),
               };
               span.log({
                 output,
                 ...(metadata !== undefined ? { metadata } : {}),
                 metrics,
+                ...(error !== undefined ? { error } : {}),
               });
             } catch (error) {
               debugLogger.error(
@@ -682,6 +692,9 @@ export function traceStreamingChannel<TChannel extends AnyAsyncChannel>(
                   : {}),
                 metrics: completion.metrics,
                 output: completion.output,
+                ...(completion.error !== undefined
+                  ? { error: completion.error }
+                  : {}),
                 result: asyncEndEvent.result as StreamingResult<TChannel>,
                 span,
                 startTime,
