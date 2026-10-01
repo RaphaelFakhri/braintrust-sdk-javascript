@@ -1,5 +1,5 @@
 import { interceptOpenAIMedia } from "./openai-media";
-import { BasePlugin } from "../core";
+import { BasePlugin, toLoggedError } from "../core";
 import {
   traceAsyncChannel,
   traceStreamingChannel,
@@ -225,26 +225,10 @@ export class OpenAIPlugin extends BasePlugin {
         name: "openai.responses.create",
         type: SpanTypeAttribute.LLM,
         extractInput: ([params]) => extractOpenAIResponsesInput(params),
-        extractFromEvent: (event) => {
-          if (event.type !== "response.completed" || !event.response) {
-            return {};
-          }
-
-          const response = event.response;
-          const data: Record<string, unknown> = {};
-
-          if (response.output !== undefined) {
-            data.output = processImagesInOutput(response.output);
-          }
-
-          const { usage: _usage, output: _output, ...metadata } = response;
-          if (Object.keys(metadata).length > 0) {
-            data.metadata = metadata;
-          }
-
-          data.metrics = parseMetricsFromUsage(response.usage);
-          return data;
-        },
+        extractFromEvent: (event) =>
+          TERMINAL_RESPONSE_EVENT_TYPES.has(event.type)
+            ? aggregateResponseStreamEvents([event])
+            : {},
       }),
     );
 
@@ -601,7 +585,17 @@ export function aggregateChatCompletionChunks(
   };
 }
 
-function aggregateResponseStreamEvents(
+// A Responses API stream ends with one of these events. Streams that hit
+// `max_output_tokens` or a content filter end with `response.incomplete`, and
+// streams that error server-side end with `response.failed`. All of them carry
+// the final `response` object with output and usage.
+const TERMINAL_RESPONSE_EVENT_TYPES = new Set([
+  "response.completed",
+  "response.incomplete",
+  "response.failed",
+]);
+
+export function aggregateResponseStreamEvents(
   chunks: OpenAIResponseStreamEvent[],
   _streamResult?: unknown,
   endEvent?: unknown,
@@ -609,16 +603,15 @@ function aggregateResponseStreamEvents(
   output: any;
   metrics: Record<string, number>;
   metadata?: Record<string, any>;
+  error?: string;
 } {
   let output: any = undefined;
   let metrics: Record<string, number> = {};
   let metadata: Record<string, any> | undefined = undefined;
+  let error: string | undefined = undefined;
 
   for (const chunk of chunks) {
-    if (!chunk || !chunk.type || !chunk.response) {
-      continue;
-    }
-    if (chunk.type !== "response.completed") {
+    if (!chunk?.response || !TERMINAL_RESPONSE_EVENT_TYPES.has(chunk.type)) {
       continue;
     }
 
@@ -633,12 +626,16 @@ function aggregateResponseStreamEvents(
     }
 
     metrics = parseMetricsFromUsage(response?.usage);
+    if (chunk.type === "response.failed") {
+      error = toLoggedError(response.error);
+    }
   }
 
   return {
     output,
     metrics: withCachedMetric(metrics, undefined, endEvent),
     ...(metadata !== undefined ? { metadata } : {}),
+    ...(error !== undefined ? { error } : {}),
   };
 }
 
