@@ -1699,7 +1699,7 @@ describe("processImagesInOutput", () => {
 describe("aggregateResponseStreamEvents", () => {
   const usage = { input_tokens: 10, output_tokens: 4, total_tokens: 14 };
 
-  it.each(["response.completed", "response.incomplete"])(
+  it.each(["response.completed", "response.incomplete", "response.failed"])(
     "reads output and usage from the terminal %s event",
     (type) => {
       const chunks = [

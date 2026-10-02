@@ -153,6 +153,7 @@ type SyncStreamChannelSpanConfig<TChannel extends AnySyncStreamChannel> =
   };
 
 type SyncStreamLike<TStreamEvent> = {
+  controller?: AbortController;
   on(event: "chunk", handler: (payload?: unknown) => void): unknown;
   on(
     event: "chatCompletion",
@@ -896,7 +897,10 @@ export function traceSyncStreamChannel<TChannel extends AnySyncStreamChannel>(
         });
 
         stream.on("event", (streamEvent) => {
-          if (!config.extractFromEvent) {
+          // After the caller breaks out of the stream, the SDK aborts the
+          // request but still emits events it already buffered. The caller
+          // never consumes those, so don't log them.
+          if (!config.extractFromEvent || stream.controller?.signal.aborted) {
             return;
           }
 
