@@ -40,6 +40,7 @@ type RunOpenAIScenario = (harness: {
 type RelevantEvent = {
   event: CapturedLogEvent;
   summaryName?: string;
+  timingDependent?: boolean;
 };
 
 type OperationSpec = {
@@ -998,6 +999,7 @@ function buildRelevantEvents(
     relevantEvents.push({
       event: providerSpan,
       summaryName: spec.childNames[0],
+      timingDependent: spec.expectsOutput === undefined,
     });
     if (spec.nestedChildNames) {
       relevantEvents.push(
@@ -1021,11 +1023,16 @@ function buildSpanTree(
   operationSpecs: OperationSpec[],
 ): SpanTreeEntry[] {
   return buildRelevantEvents(events, operationSpecs).map(
-    ({ event, summaryName }) => {
+    ({ event, summaryName, timingDependent }) => {
+      const fields = spanTreeFields(event);
       return {
         event,
         fields: {
-          ...spanTreeFields(event),
+          // Output, metadata and metrics of timing-dependent spans vary
+          // between runs, so only snapshot what the caller passed in.
+          ...(timingDependent
+            ? { span_attributes: fields.span_attributes, input: fields.input }
+            : fields),
           context: event.context,
         },
         name: summaryName ?? event.span.name,
