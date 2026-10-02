@@ -114,7 +114,6 @@ type StreamingChannelSpanConfig<TChannel extends AnyAsyncChannel> =
       metadata?: Record<string, unknown>;
       metrics: Record<string, number>;
       output: unknown;
-      error?: string;
       result: StreamingResult<TChannel>;
       span: Span;
       startTime: number;
@@ -389,7 +388,6 @@ function runStreamingCompletionHook<TChannel extends AnyAsyncChannel>(args: {
   metadata?: Record<string, unknown>;
   metrics: Record<string, number>;
   output: unknown;
-  error?: string;
   result: StreamingResult<TChannel>;
   span: Span;
   startTime: number;
@@ -406,7 +404,6 @@ function runStreamingCompletionHook<TChannel extends AnyAsyncChannel>(args: {
       ...(args.metadata !== undefined ? { metadata: args.metadata } : {}),
       metrics: args.metrics,
       output: args.output,
-      ...(args.error !== undefined ? { error: args.error } : {}),
       result: args.result,
       span: args.span,
       startTime: args.startTime,
@@ -608,7 +605,6 @@ export function traceStreamingChannel<TChannel extends AnyAsyncChannel>(
                   metadata?: Record<string, unknown>;
                   metrics: Record<string, number>;
                   output: unknown;
-                  error?: string;
                 }
               | undefined;
             try {
@@ -657,7 +653,6 @@ export function traceStreamingChannel<TChannel extends AnyAsyncChannel>(
                 ...(metadata !== undefined ? { metadata } : {}),
                 metrics,
                 output,
-                ...(error !== undefined ? { error } : {}),
               };
               span.log({
                 output,
@@ -692,9 +687,6 @@ export function traceStreamingChannel<TChannel extends AnyAsyncChannel>(
                   : {}),
                 metrics: completion.metrics,
                 output: completion.output,
-                ...(completion.error !== undefined
-                  ? { error: completion.error }
-                  : {}),
                 result: asyncEndEvent.result as StreamingResult<TChannel>,
                 span,
                 startTime,

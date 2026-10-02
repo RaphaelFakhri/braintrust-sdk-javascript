@@ -626,7 +626,7 @@ export function aggregateResponseStreamEvents(
     }
 
     metrics = parseMetricsFromUsage(response?.usage);
-    if (chunk.type === "response.failed") {
+    if (chunk.type === "response.failed" && response.error) {
       error = toLoggedError(response.error);
     }
   }
