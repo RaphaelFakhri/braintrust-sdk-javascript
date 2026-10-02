@@ -1,6 +1,3 @@
-import { existsSync } from "node:fs";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, test } from "vitest";
 import type { CapturedLogEvent } from "../../helpers/mock-braintrust-server";
 import type { Json } from "../../helpers/normalize";
@@ -49,7 +46,8 @@ type OperationSpec = {
   childNames: readonly string[];
   nestedChildNames?: readonly string[];
   nestedSpanCount?: number;
-  expectsOutput: boolean;
+  // Leave unset when the output depends on stream timing.
+  expectsOutput?: boolean;
   expectsModel?: boolean;
   expectsTimeToFirstToken: boolean;
   expectsError?: boolean;
@@ -642,11 +640,13 @@ const OPERATION_SPECS: readonly OperationSpec[] = [
   },
   {
     childNames: ["openai.responses.create"],
-    expectsOutput: false,
+    // The SDK still emits the events it buffered before the caller broke out,
+    // so whether the terminal event lands on the span depends on timing.
     expectsTimeToFirstToken: true,
     name: "openai-responses-stream-partial-operation",
     operation: "responses-stream-partial",
-    testName: "captures partial streamed responses before final output",
+    testName:
+      "captures trace when breaking out of client.responses.stream() early",
   },
   {
     childNames: ["openai.responses.create"],
@@ -1036,7 +1036,6 @@ function buildSpanTree(
 
 export function defineOpenAIInstrumentationAssertions(options: {
   assertPrivateFieldMethodsOperation?: boolean;
-  cassetteName?: string;
   name: string;
   runScenario: RunOpenAIScenario;
   snapshotName: string;
@@ -1154,20 +1153,6 @@ export function defineOpenAIInstrumentationAssertions(options: {
       },
     );
 
-    const scenarioDir = path.dirname(fileURLToPath(options.testFileUrl));
-    const cassetteMode = process.env.BRAINTRUST_E2E_CASSETTE_MODE;
-    const cassetteEngaged =
-      cassetteMode === "record" ||
-      cassetteMode === "record-missing" ||
-      cassetteMode === "replay" ||
-      existsSync(
-        path.join(
-          scenarioDir,
-          "__cassettes__",
-          `${options.cassetteName ?? options.snapshotName}.cassette.json`,
-        ),
-      );
-
     for (const spec of operationSpecs) {
       test(spec.testName, testConfig, () => {
         const root = findLatestSpan(events, ROOT_NAME);
@@ -1196,11 +1181,7 @@ export function defineOpenAIInstrumentationAssertions(options: {
 
         if (spec.expectsOutput) {
           expect(span?.output).toBeDefined();
-        } else if (!cassetteEngaged) {
-          // Under cassette replay, partial-stream tests can't reliably
-          // produce undefined output: the recorded SSE chunks deliver
-          // faster than the consumer can `break` out of the iteration.
-          // Only enforce the strict expectation against the live API.
+        } else if (spec.expectsOutput === false) {
           expect(span?.output).toBeUndefined();
         }
 

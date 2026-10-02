@@ -1737,7 +1737,7 @@ describe("aggregateResponseStreamEvents", () => {
       },
     ]);
 
-    expect(result.error).toBe(JSON.stringify(error));
+    expect(result.error).toBe("server_error: The model failed.");
     expect(result.metadata).toMatchObject({ status: "failed", error });
   });
 

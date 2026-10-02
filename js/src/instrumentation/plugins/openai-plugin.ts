@@ -1,5 +1,5 @@
 import { interceptOpenAIMedia } from "./openai-media";
-import { BasePlugin, toLoggedError } from "../core";
+import { BasePlugin } from "../core";
 import {
   traceAsyncChannel,
   traceStreamingChannel,
@@ -616,18 +616,18 @@ export function aggregateResponseStreamEvents(
     }
 
     const response = chunk.response;
-    if (response?.output !== undefined) {
+    if (response.output !== undefined) {
       output = processImagesInOutput(response.output);
     }
 
-    const { usage: _usage, output: _output, ...rest } = response || {};
+    const { usage: _usage, output: _output, ...rest } = response;
     if (Object.keys(rest).length > 0) {
       metadata = rest;
     }
 
-    metrics = parseMetricsFromUsage(response?.usage);
+    metrics = parseMetricsFromUsage(response.usage);
     if (chunk.type === "response.failed" && response.error) {
-      error = toLoggedError(response.error);
+      error = `${response.error.code}: ${response.error.message}`;
     }
   }
 

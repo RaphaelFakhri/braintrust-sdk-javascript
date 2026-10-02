@@ -178,6 +178,7 @@ export interface OpenAIModerationResponse {
 export interface OpenAIResponse {
   output?: unknown;
   usage?: OpenAIUsage;
+  error?: { code: string; message: string } | null;
   [key: string]: unknown;
 }
 

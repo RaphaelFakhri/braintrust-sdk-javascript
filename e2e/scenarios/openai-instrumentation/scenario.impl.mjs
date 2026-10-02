@@ -1029,6 +1029,10 @@ export async function runOpenAIInstrumentationScenario(options) {
             max_output_tokens: 24,
           });
           await collectOneAndReturn(stream);
+          // The SDK keeps emitting events it already buffered after the
+          // break. Wait for the aborted stream to settle so the span doesn't
+          // depend on how much work runs after this operation.
+          await stream.done().catch(() => {});
         },
       );
 
